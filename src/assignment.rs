@@ -40,6 +40,10 @@ pub(crate) fn assign(
         |r| r.get(0),
     )?;
     ensure!(exists, "找不到独立版本");
+    db.execute(
+        "DELETE FROM archives WHERE task_id=(SELECT task_id FROM versions WHERE id=?)",
+        [version],
+    )?;
     let assignment = Assignment {
         id: uuid::Uuid::new_v4().to_string(),
         version_id: version.into(),
@@ -54,20 +58,35 @@ pub(crate) fn assign(
     view(db, &assignment, None)
 }
 
-pub(crate) fn inbox(cli: &Cli, db: &Connection, recipient: &str) -> Result<Value> {
+pub(crate) fn inbox(
+    cli: &Cli,
+    db: &Connection,
+    recipient: &str,
+    limit: usize,
+    offset: usize,
+    cursor: Option<i64>,
+) -> Result<Value> {
     crate::agent::check_target(cli, recipient)?;
-    let mut stmt = db.prepare("SELECT body,plan_id FROM assignments ORDER BY rowid DESC")?;
+    let (rows, total, next_cursor) = crate::maintenance::page(
+        db,
+        "assignments",
+        "recipient",
+        Some(recipient),
+        limit,
+        offset,
+        cursor,
+    )?;
     let mut items = Vec::new();
-    for row in stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
-    })? {
-        let (body, plan_id) = row?;
+    for body in rows {
         let item: Assignment = serde_json::from_str(&body)?;
-        if item.recipient == recipient {
-            items.push(view(db, &item, plan_id.as_deref())?);
-        }
+        let plan: Option<String> = db.query_row(
+            "SELECT plan_id FROM assignments WHERE id=?",
+            [&item.id],
+            |r| r.get(0),
+        )?;
+        items.push(view(db, &item, plan.as_deref())?);
     }
-    Ok(json!({"assignments":items}))
+    Ok(json!({"assignments":items,"total":total,"next_cursor":next_cursor}))
 }
 
 pub(crate) fn claim(
@@ -76,11 +95,10 @@ pub(crate) fn claim(
     state: &Path,
     id: &str,
     recipient: &str,
-    open: bool,
 ) -> Result<Value> {
     crate::agent::check_target(cli, recipient)?;
     // Serialize preparation without holding a SQLite writer during adapter I/O.
-    let lock = app::operation_lock(state)?;
+
     let (body, plan_id): (String, Option<String>) = db
         .query_row(
             "SELECT body,plan_id FROM assignments WHERE id=?",
@@ -121,8 +139,8 @@ pub(crate) fn claim(
     if let Some(guard) = &mut preparation {
         guard.finish();
     }
-    drop(lock);
-    let plan = app::apply(cli, db, &plan_id, open)?;
+
+    let plan = app::apply(cli, db, &plan_id)?;
     let mut result = view(db, &item, Some(&plan_id))?;
     result["plan"] = plan;
     Ok(result)

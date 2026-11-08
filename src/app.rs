@@ -1,7 +1,7 @@
 use crate::agent::{discover, load_common};
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -51,6 +51,21 @@ pub(crate) enum Action {
         timeout_seconds: u64,
     },
     Mcp,
+    Backup {
+        path: PathBuf,
+    },
+    Restore {
+        path: PathBuf,
+    },
+    Archive {
+        task_id: String,
+    },
+    Gc {
+        #[arg(long, default_value = "30d")]
+        older_than: String,
+        #[arg(long)]
+        execute: bool,
+    },
     /// Discover built-in and registered local agents.
     Agents,
     /// Join the local session exchange using a versioned protocol.
@@ -95,6 +110,12 @@ pub(crate) enum Action {
     Versions {
         #[arg(long)]
         task_id: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long)]
+        cursor: Option<i64>,
     },
     Prepare {
         version: String,
@@ -111,6 +132,12 @@ pub(crate) enum Action {
     Inbox {
         #[arg(long)]
         recipient: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long)]
+        cursor: Option<i64>,
     },
     Claim {
         assignment: String,
@@ -137,6 +164,17 @@ pub(crate) enum Action {
 }
 #[derive(Subcommand, Clone)]
 pub(crate) enum MemoryAction {
+    List {
+        #[arg(long)]
+        project: PathBuf,
+    },
+    Unbind {
+        #[arg(long)]
+        project: PathBuf,
+        #[arg(long)]
+        path: PathBuf,
+    },
+
     Bind {
         #[arg(long)]
         project: PathBuf,
@@ -276,30 +314,30 @@ fn capture(cli: &Cli, db: &mut Connection, source: &str, source_agent: &str) -> 
     let mut parent_plan_id = None;
     let mut parent_version_id = None;
     {
-        let mut stmt =
-            tx.prepare("SELECT body FROM plans WHERE status != 'previewed' ORDER BY rowid DESC")?;
-        for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
-            let prior: Plan = serde_json::from_str(&row?)?;
-            if prior.target_id == item.meta.id && prior.target == item.reference {
-                task_id = prior.task_id;
-                parent_plan_id = Some(prior.id);
-                parent_version_id = prior.version_id;
-                break;
-            }
+        let prior: Option<String> = tx.query_row("SELECT body FROM plans WHERE target_id=? AND target_path=? AND status != 'previewed' ORDER BY rowid DESC LIMIT 1",params![item.meta.id,item.reference.to_string_lossy()],|r|r.get(0)).optional()?;
+        if let Some(body) = prior {
+            let prior: Plan = serde_json::from_str(&body)?;
+            task_id = prior.task_id;
+            parent_plan_id = Some(prior.id);
+            parent_version_id = prior.version_id;
         }
-        let mut stmt = tx.prepare("SELECT body FROM versions ORDER BY rowid DESC")?;
-        for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
-            let prior: Version = serde_json::from_str(&row?)?;
-            if prior.source_agent == source_agent
-                && prior.source_id == item.meta.id
-                && prior.source == item.reference
+        let prior:Option<String>=tx.query_row("SELECT body FROM versions WHERE source_agent=? AND source_id=? AND source_path=? ORDER BY rowid DESC LIMIT 1",params![source_agent,item.meta.id,item.reference.to_string_lossy()],|r|r.get(0)).optional()?;
+        if let Some(body) = prior {
+            let prior: Version = serde_json::from_str(&body)?;
+            if prior.source_digest == digest(&before)
+                && prior.parent_plan_id == parent_plan_id
+                && serde_json::to_value(&prior.workspace)? == serde_json::to_value(&ws)?
+                && serde_json::to_value(&prior.memory)? == serde_json::to_value(&memory)?
             {
-                task_id = prior.task_id;
-                parent_version_id = Some(prior.id);
-                break;
+                tx.execute("DELETE FROM archives WHERE task_id=?", [&prior.task_id])?;
+                tx.commit()?;
+                return Ok(prior);
             }
+            task_id = prior.task_id;
+            parent_version_id = Some(prior.id);
         }
     }
+    tx.execute("DELETE FROM archives WHERE task_id=?", [&task_id])?;
     let v = Version {
         format_version: 1,
         id: uuid::Uuid::new_v4().to_string(),
@@ -494,7 +532,16 @@ fn notes(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     if meta.is_dir() {
         ensure!(out.len() < 128, "笔记数量超过 128");
         for entry in fs::read_dir(path)? {
-            notes(&entry?.path(), out)?;
+            let entry = entry?;
+            if entry.file_type()?.is_dir()
+                && matches!(
+                    entry.file_name().to_str(),
+                    Some(".git" | "node_modules" | "target")
+                )
+            {
+                continue;
+            }
+            notes(&entry.path(), out)?;
         }
     } else if path.extension().is_some_and(|v| v == "md") {
         out.push(path.canonicalize()?);
@@ -569,7 +616,7 @@ fn create_plan(
 ) -> Result<Value> {
     crate::agent::check_target(cli, target_agent)?;
     let version = capture(cli, db, source, source_agent)?;
-    let _lock = operation_lock(state)?;
+
     let (plan, mut preparation) =
         prepare_version(cli, db, state, &version.id, target_agent, true, None)?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -619,6 +666,7 @@ pub(crate) fn prepare_version(
     instructions: Option<&str>,
 ) -> Result<(Value, Preparation)> {
     let version = load_version(db, version_id)?;
+    db.execute("DELETE FROM archives WHERE task_id=?", [&version.task_id])?;
     let mut common: Transcript = Transcript::new(version.meta, version.messages);
     let ws = version.workspace;
     let memory = version.memory;
@@ -750,8 +798,7 @@ fn verify_published_target(cli: &Cli, plan: &Plan) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn apply(cli: &Cli, db: &mut Connection, id: &str, open: bool) -> Result<Value> {
-    let lock = operation_lock(cli.state_dir.as_deref().context("缺少状态目录")?)?;
+pub(crate) fn apply(cli: &Cli, db: &mut Connection, id: &str) -> Result<Value> {
     let (plan, status) = load_plan(db, id)?;
     if !crate::agent::builtin_target(&plan.target_agent) {
         ensure!(
@@ -764,6 +811,7 @@ pub(crate) fn apply(cli: &Cli, db: &mut Connection, id: &str, open: bool) -> Res
         ws.git_dir == plan.workspace.git_dir && ws.root == plan.workspace.root,
         "工作树身份已变化"
     );
+    db.execute("DELETE FROM archives WHERE task_id=?", [&plan.task_id])?;
     if status != "previewed" {
         let metadata = fs::metadata(&plan.target).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -848,8 +896,8 @@ pub(crate) fn apply(cli: &Cli, db: &mut Connection, id: &str, open: bool) -> Res
         )?;
     }
     tx.commit()?;
-    drop(lock);
-    let mut result = view(
+
+    let result = view(
         &plan,
         if status == "previewed" {
             "waiting_for_open"
@@ -857,19 +905,6 @@ pub(crate) fn apply(cli: &Cli, db: &mut Connection, id: &str, open: bool) -> Res
             &status
         },
     );
-    if open {
-        match crate::agent::open(&plan.target_agent, &plan.target_id, &plan.workspace.cwd) {
-            Ok(()) => {
-                db.execute("UPDATE plans SET status='open_requested' WHERE id=?", [id])?;
-                result["status"] = json!("open_requested");
-            }
-            Err(error) => {
-                let issue = crate::error::response(&error);
-                result["open_error"] = issue["error"].clone();
-                result["open_issue"] = issue;
-            }
-        }
-    }
     Ok(result)
 }
 fn lock_file(state: &Path) -> Result<fs::File> {
@@ -891,12 +926,6 @@ pub(crate) fn operation_lock(state: &Path) -> Result<fs::File> {
 }
 
 fn cleanup_orphans(db: &mut Connection, state: &Path) -> Result<()> {
-    let lock = lock_file(state)?;
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
-        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
-    }
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for entry in fs::read_dir(state)? {
         let entry = entry?;
@@ -939,8 +968,35 @@ pub(crate) fn run(mut cli: Cli) -> Result<Value> {
         .state_dir
         .clone()
         .unwrap_or(home()?.join(".local/share/agent-handoff"));
-    private_dir(&state)?;
-    let state = state.canonicalize()?;
+    let read_only = matches!(
+        &cli.command,
+        Action::Sessions { .. }
+            | Action::Agents
+            | Action::Versions { .. }
+            | Action::Inbox { .. }
+            | Action::Status { .. }
+            | Action::Read { .. }
+            | Action::Memory {
+                action: MemoryAction::List { .. }
+            }
+            | Action::Gc { execute: false, .. }
+    );
+    if !read_only {
+        private_dir(&state)?;
+    }
+    let state = if state.exists() {
+        state.canonicalize()?
+    } else {
+        std::path::absolute(state)?
+    };
+    if let Action::Restore { path } = &cli.command {
+        return crate::maintenance::restore(&state, path);
+    }
+    let write_lock = if !read_only && !matches!(cli.command, Action::Restore { .. }) {
+        Some(operation_lock(&state)?)
+    } else {
+        None
+    };
     let database = state.join("handoff.sqlite3");
     let initialized = state.join(".handoff-state");
     let database_exists = database.try_exists()?;
@@ -964,31 +1020,81 @@ pub(crate) fn run(mut cli: Cli) -> Result<Value> {
             true,
         ));
     }
-    let mut flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE;
+    let mut flags = if read_only {
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+    } else {
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+    };
     if !database_exists {
         flags |= rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
     }
-    let mut db = Connection::open_with_flags(database, flags)?;
+    let mut db = if read_only && !database_exists {
+        Connection::open_in_memory()?
+    } else {
+        Connection::open_with_flags(database, flags)?
+    };
     db.busy_timeout(std::time::Duration::from_secs(10))?;
-    db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS protocol_agents(id TEXT PRIMARY KEY, role TEXT NOT NULL); CREATE TABLE IF NOT EXISTS assignments(id TEXT PRIMARY KEY,body TEXT NOT NULL,plan_id TEXT REFERENCES plans(id)); CREATE TABLE IF NOT EXISTS versions(id TEXT PRIMARY KEY,body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS bindings(project TEXT NOT NULL,path TEXT NOT NULL,PRIMARY KEY(project,path)); CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY,body TEXT NOT NULL,status TEXT NOT NULL);")?;
-    {
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)",
-        )?;
-        tx.execute(
-            "INSERT OR IGNORE INTO metadata(key,value) VALUES('state_id',?)",
-            [uuid::Uuid::new_v4().to_string()],
-        )?;
-        if !initialized.exists() {
-            write_new(&initialized, b"agent-handoff state v1")?;
+    if !read_only || !database_exists {
+        db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS protocol_agents(id TEXT PRIMARY KEY, role TEXT NOT NULL); CREATE TABLE IF NOT EXISTS assignments(id TEXT PRIMARY KEY,body TEXT NOT NULL,plan_id TEXT REFERENCES plans(id)); CREATE TABLE IF NOT EXISTS versions(id TEXT PRIMARY KEY,body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS bindings(project TEXT NOT NULL,path TEXT NOT NULL,PRIMARY KEY(project,path)); CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY,body TEXT NOT NULL,status TEXT NOT NULL);")?;
+        {
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)",
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO metadata(key,value) VALUES('state_id',?)",
+                [uuid::Uuid::new_v4().to_string()],
+            )?;
+            if !read_only && !initialized.exists() {
+                write_new(&initialized, b"agent-handoff state v1")?;
+            }
+            tx.commit()?;
         }
-        tx.commit()?;
     }
-    cleanup_orphans(&mut db, &state)?;
+    if !read_only {
+        crate::maintenance::migrate(&mut db)?;
+        crate::maintenance::recover_gc(&db, &state)?;
+        cleanup_orphans(&mut db, &state)?;
+    }
     cli.state_dir = Some(state.clone());
     cli.registered = crate::protocol::registry(&db)?;
-    let result = (|| match &cli.command {
+    let mut result = (|| match &cli.command {
+        Action::Backup { path } => crate::maintenance::backup(&mut db, &state, path),
+        Action::Restore { .. } => unreachable!(),
+        Action::Archive { task_id } => crate::maintenance::archive(&mut db, &state, task_id),
+        Action::Gc {
+            older_than,
+            execute,
+        } => crate::maintenance::gc(&mut db, &state, older_than, *execute),
+        Action::Memory {
+            action: MemoryAction::List { project },
+        } => {
+            let ws = workspace(project)?;
+            let mut stmt = db.prepare("SELECT path FROM bindings WHERE project=? ORDER BY path")?;
+            let paths = stmt
+                .query_map([ws.root.to_string_lossy().as_ref()], |r| {
+                    r.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(
+                json!({"bindings":paths.into_iter().map(|path|json!({"available":Path::new(&path).is_file() || Path::new(&path).is_dir(),"path":path})).collect::<Vec<_>>()}),
+            )
+        }
+        Action::Memory {
+            action: MemoryAction::Unbind { project, path },
+        } => {
+            let ws = workspace(project)?;
+            let path = if path.exists() {
+                path.canonicalize()?
+            } else {
+                crate::maintenance::absolute(path)?
+            };
+            let removed = db.execute(
+                "DELETE FROM bindings WHERE project=? AND path=?",
+                params![ws.root.to_string_lossy(), path.to_string_lossy()],
+            )?;
+            Ok(json!({"removed":removed,"path":path}))
+        }
         Action::Agents => Ok(crate::protocol::list(&cli)),
         Action::RegisterAgent {
             id,
@@ -1076,7 +1182,6 @@ pub(crate) fn run(mut cli: Cli) -> Result<Value> {
             Ok(version_view(&capture(&cli, &mut db, source, from)?))
         }
         Action::Prepare { version, to } => {
-            let _lock = operation_lock(&state)?;
             let (plan, mut preparation) =
                 prepare_version(&cli, &db, &state, version, to, false, None)?;
             let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1086,29 +1191,44 @@ pub(crate) fn run(mut cli: Cli) -> Result<Value> {
             preparation.finish();
             Ok(plan)
         }
-        Action::Versions { task_id } => {
-            let mut stmt = db.prepare("SELECT body FROM versions ORDER BY rowid DESC")?;
-            let mut versions = Vec::new();
-            for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
-                let v: Version = serde_json::from_str(&row?)?;
-                if task_id.as_ref().is_none_or(|t| t == &v.task_id) {
-                    versions.push(version_view(&v));
-                }
-            }
-            Ok(json!({"versions":versions}))
+        Action::Versions {
+            task_id,
+            limit,
+            offset,
+            cursor,
+        } => {
+            let (rows, total, next_cursor) = crate::maintenance::page(
+                &db,
+                "versions",
+                "task_id",
+                task_id.as_deref(),
+                *limit,
+                *offset,
+                *cursor,
+            )?;
+            let versions = rows
+                .into_iter()
+                .map(|body| serde_json::from_str::<Version>(&body).map(|v| version_view(&v)))
+                .collect::<serde_json::Result<Vec<_>>>()?;
+            Ok(json!({"versions":versions,"total":total,"next_cursor":next_cursor}))
         }
         Action::Assign {
             version,
             to,
             instructions,
         } => crate::assignment::assign(&cli, &db, version, to, instructions),
-        Action::Inbox { recipient } => crate::assignment::inbox(&cli, &db, recipient),
+        Action::Inbox {
+            recipient,
+            limit,
+            offset,
+            cursor,
+        } => crate::assignment::inbox(&cli, &db, recipient, *limit, *offset, *cursor),
         Action::Claim {
             assignment,
             recipient,
-            open,
-        } => crate::assignment::claim(&cli, &mut db, &state, assignment, recipient, *open),
-        Action::Apply { plan, open } => apply(&cli, &mut db, plan, *open),
+            open: _,
+        } => crate::assignment::claim(&cli, &mut db, &state, assignment, recipient),
+        Action::Apply { plan, open: _ } => apply(&cli, &mut db, plan),
         Action::Status { id } => {
             let (p, s) = load_plan(&db, id)?;
             Ok(view(&p, &s))
@@ -1146,8 +1266,40 @@ pub(crate) fn run(mut cli: Cli) -> Result<Value> {
             )
         }
     })();
-    if result.is_err() {
-        cleanup_orphans(&mut db, &state)?;
+
+    drop(write_lock);
+    let requested = matches!(
+        cli.command,
+        Action::Apply { open: true, .. } | Action::Claim { open: true, .. }
+    );
+    if requested {
+        if let Ok(value) = &mut result {
+            let plan = if value.get("plan").is_some() {
+                &mut value["plan"]
+            } else {
+                value
+            };
+            let id = plan["id"].as_str().context("缺少计划 ID")?.to_string();
+            let target = plan["target_agent"].as_str().context("缺少目标")?;
+            let target_id = plan["target_id"].as_str().context("缺少目标 ID")?;
+            let cwd = Path::new(plan["workspace"]["cwd"].as_str().context("缺少目录")?);
+            match crate::agent::open(target, target_id, cwd) {
+                Ok(()) => {
+                    db.execute("UPDATE plans SET status='open_requested' WHERE id=?", [id])?;
+                    plan["status"] = json!("open_requested");
+                }
+                Err(e) => {
+                    let issue = crate::error::response(&e);
+                    plan["open_error"] = issue["error"].clone();
+                    plan["open_issue"] = issue;
+                }
+            }
+        }
+        if let Ok(value) = &mut result {
+            if let Some(status) = value.get("plan").and_then(|p| p.get("status")).cloned() {
+                value["status"] = status;
+            }
+        }
     }
     result
 }

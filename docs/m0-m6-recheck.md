@@ -59,6 +59,20 @@ cargo build --locked
 PYTHONPATH=tests python3 -m unittest -v m9_builtin_history
 ```
 
+## 状态生命周期专项验收
+
+开发分支 `feat/handoff-state-lifecycle` 覆盖方案第 2–6 步。新增用例位于 [m10_state.py](../tests/m10_state.py)，使用独立临时目录、真实 Git worktree、CLI 和 stdio MCP。
+
+- 查询不会初始化空状态目录、迁移已有库或删除准备目录，数据库缺失保留恢复指引。
+- 删除笔记后可列出旧绑定并解绑，已冻结笔记继续回读；依赖和构建目录的超限 Markdown 被跳过。
+- 旧备份与最新备份往返恢复后，后建计划仍用原 ID 执行。恢复保留协议客户端的新续写，生成回退备份，损坏备份被拒绝。
+- 旧表结构可查询并在下次写入迁移，来源查询使用索引。并发相同采集复用版本，HEAD 改变产生新版本。新增记录期间按游标翻页无重复，收件箱分页可用。
+- 待领取指派阻止归档。GC 默认预览，执行后保留未知提交目录和原生目标，会删除符合条件的归档计划。清理中断后下次写入恢复目录，活动分叉保留祖先计划与版本。
+
+在本机 SQLite 隔离样本中，20,000 条约 2 KiB 的版本记录按来源查询，JSON 条件扫描约 21.6 ms，生成列索引查询约 0.024 ms。该样本用于确认查询路径，实际用户数据的延迟取决于磁盘和记录规模。
+
+最终完整回归通过 54 项测试，三端矩阵的 64 项检查与观察全部完成，其中主动拉取和指派共 12 条链路通过。构建、Rust 格式和文档链接检查通过。回归中发现既有中断测试在监督进程已回收 SDK 后重复发送终止信号，已改为断言 SDK 确实退出，并通过专项及完整复验。当前环境缺少 Clippy 组件，未执行 Clippy 检查。桌面窗口沿用历史验收证据，本轮验证协议、状态及原生存储。
+
 ## Reproduce / 本地复现
 
 Start from the repository root on macOS with Git, Rust 1.96+, Python 3 and zstd. The full suite requires Node.js 24.9+ and the tested Harness package on PATH. For example, install the SDK with `npm install --global @deepseek-ai/dsh@0.2.2-rc.1`.
@@ -70,6 +84,6 @@ python3 -m unittest discover -s tests -p 'm*.py' -v
 python3 tests/acceptance_matrix.py
 ```
 
-The regression suite contains 47 tests. The matrix runs 64 checks and observations, including the 12 cross-client pull and assignment flows. It writes a JSON report to stdout. The held-database-lock case allows 30 seconds for its MCP response, records CLI/MCP elapsed times, and verifies capture succeeds after the lock is released. Other requests retain the default 15-second timeout. The commands use isolated fixture data; no live conversations or credentials are required.
+The regression suite contains 54 tests. The matrix runs 64 checks and observations, including the 12 cross-client pull and assignment flows. It writes a JSON report to stdout. The held-database-lock case allows 30 seconds for its MCP response, records CLI/MCP elapsed times, and verifies capture succeeds after the lock is released. Other requests retain the default 15-second timeout. The commands use isolated fixture data; no live conversations or credentials are required.
 
 Use [the backup and recovery tests](../tests/m7_boundaries.py) for the database restore scenarios. To reproduce the manual worktree check, run `python3 scripts/m0_fixture.py` to generate a disposable repository and native-test inputs under the ignored `.m0` directory. After continuing a task in the real target client, use `python3 scripts/m0_verify.py --help` to check an exported native transcript against that fixture.

@@ -3,6 +3,7 @@ mod app;
 mod assignment;
 mod deepseek;
 mod error;
+mod maintenance;
 mod mcp;
 mod protocol;
 use clap::Parser;

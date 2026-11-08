@@ -99,6 +99,22 @@ handoff register-agent --id example-agent --role both --protocol-version 1
 
 来源端在返回的 `sessions_dir` 中提供协议 JSON 文件，接收方拉取时才生成版本。接收端读取交付的 `target_path`，在 `workspace.cwd` 恢复消息并用同一会话 ID 保存续写。已有私有存储的客户端可以在自己一侧转换格式。[接入协议与消息样例](docs/agent-protocol.md)
 
+## 本地状态维护
+
+```sh
+handoff memory list --project .
+handoff memory unbind --project . --path /path/to/removed-note.md
+handoff backup ../handoff-backup
+handoff restore ../handoff-backup
+handoff versions --limit 20
+handoff inbox --recipient codex --limit 20
+handoff archive TASK_ID
+handoff gc --older-than 30d
+handoff gc --older-than 30d --execute
+```
+
+版本和收件箱列表返回 `next_cursor`，下一页通过 `--cursor` 传入，MCP 使用 `cursor` 参数。恢复使用备份记录的原状态目录，操作前生成回退备份。原 worktree 和内置客户端会话库需要单独保留。清理默认预览显式归档的任务。[状态维护与恢复约定](docs/development-plan.md)
+
 ## CLI 与 MCP 接口
 
 | 操作 | CLI | MCP 工具 |

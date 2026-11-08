@@ -69,6 +69,9 @@ struct Capture {
 #[serde(deny_unknown_fields)]
 struct Versions {
     task_id: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    cursor: Option<i64>,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -87,6 +90,9 @@ struct Assign {
 #[serde(deny_unknown_fields)]
 struct Inbox {
     recipient: String,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    cursor: Option<i64>,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -137,6 +143,9 @@ impl HandoffServer {
     async fn list_assignments(&self, Parameters(p): Parameters<Inbox>) -> CallToolResult {
         self.execute(Action::Inbox {
             recipient: p.recipient,
+            limit: p.limit.unwrap_or(100),
+            offset: p.offset.unwrap_or(0),
+            cursor: p.cursor,
         })
         .await
     }
@@ -163,7 +172,13 @@ impl HandoffServer {
     }
     #[tool(description = "列出中转站已保存的独立版本，可按 task_id 查询版本及其父版本")]
     async fn list_versions(&self, Parameters(p): Parameters<Versions>) -> CallToolResult {
-        self.execute(Action::Versions { task_id: p.task_id }).await
+        self.execute(Action::Versions {
+            task_id: p.task_id,
+            limit: p.limit.unwrap_or(100),
+            offset: p.offset.unwrap_or(0),
+            cursor: p.cursor,
+        })
+        .await
     }
     #[tool(
         description = "仅从中转站的指定版本生成目标计划；来源记录和原笔记可以已不可访问，随后用 apply_handoff 发布"

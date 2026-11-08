@@ -99,6 +99,22 @@ handoff register-agent --id example-agent --role both --protocol-version 1
 
 The result includes a private `sessions_dir`. Store one v1 JSON file per source session there. As a recipient, read the `target_path` returned by apply or claim, resume its messages in `workspace.cwd`, and save new turns under the same session ID. The hub takes a snapshot when a recipient pulls or someone requests a capture. The discovery response includes a minimal wire example. [Protocol and message examples](docs/agent-protocol.md)
 
+## State maintenance
+
+```sh
+handoff memory list --project .
+handoff memory unbind --project . --path /path/to/removed-note.md
+handoff backup ../handoff-backup
+handoff restore ../handoff-backup
+handoff versions --limit 20
+handoff inbox --recipient codex --limit 20
+handoff archive TASK_ID
+handoff gc --older-than 30d
+handoff gc --older-than 30d --execute
+```
+
+Version and inbox pages return `next_cursor`. Pass it as `--cursor` on the next call (MCP `cursor`). Restore uses the original state directory recorded in the backup and creates a rollback backup. Preserve the original worktree and native client stores separately. GC previews explicitly archived tasks by default. [State lifecycle and recovery](docs/development-plan.md)
+
 ## CLI and MCP reference
 
 | Task | CLI | MCP tool |

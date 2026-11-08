@@ -435,7 +435,8 @@ class BoundaryTests(unittest.TestCase):
                     self.assert_process_gone(sdk)
                     self.assert_process_gone(int(helper_marker.read_text()))
                     self.assertEqual(self.f.cli('inbox', '--recipient', 'deepseek')['assignments'][0]['status'], 'pending')
-                    self.assertEqual(self.orphans(), [])
+                    # Read-only inbox leaves interrupted preparation intact.
+                    self.assertTrue(self.orphans())
                     delivered = self.f.cli('claim', assignment['id'], '--recipient', 'deepseek')
                     retry = self.f.cli('claim', assignment['id'], '--recipient', 'deepseek')
                     self.assertEqual(delivered['plan']['target_id'], retry['plan']['target_id'])
@@ -541,12 +542,10 @@ class BoundaryTests(unittest.TestCase):
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
             process.communicate(timeout=5)
-            # The adapter has its own process group, separate from the killed hub.
+            # The supervisor must reap the SDK after hub death. Verify that
+            # behavior instead of sending a second signal to a possibly stale PID.
             if marker.exists():
-                try:
-                    os.killpg(int(marker.read_text()), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                self.assert_process_gone(int(marker.read_text()))
             if observer is not None:
                 try:
                     stdout, stderr = observer.communicate(timeout=5)
@@ -556,10 +555,10 @@ class BoundaryTests(unittest.TestCase):
                     if observer.poll() is None:
                         observer.kill()
                         observer.communicate(timeout=5)
-        # Once the operation lock is released, the next API call reclaims preparation.
+        # The next mutating call reclaims preparation; read-only queries preserve it.
         inbox = self.server.call('list_assignments', {'recipient': 'deepseek'})['assignments']
         self.assertEqual(inbox[0]['status'], 'pending')
-        self.assertEqual(self.orphans(), [])
+        self.assertTrue(self.orphans())
         claimed = self.f.cli('claim', a['id'], '--recipient', 'deepseek')
         self.assertEqual(claimed['status'], 'waiting_for_open')
         self.assertEqual(self.orphans(), [])
