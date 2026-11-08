@@ -88,10 +88,22 @@ handoff claim ASSIGNMENT_ID --recipient deepseek
 
 To reuse a saved version without an assignment, run `handoff prepare VERSION_ID --to TARGET` and then `handoff apply PLAN_ID`. For project conventions, bind a Markdown file **before** taking the snapshot, for example `handoff memory bind --project . --path ./NOTES.md`. Bound note contents become part of the target session.
 
+## Connect your own agent
+
+A local agent can join at runtime through the CLI or stdio MCP. Choose `source`, `target` or `both`. Agents using private storage can translate their records at this boundary.
+
+```sh
+handoff agents
+handoff register-agent --id example-agent --role both --protocol-version 1
+```
+
+The result includes a private `sessions_dir`. Store one v1 JSON file per source session there. As a recipient, read the `target_path` returned by apply or claim, resume its messages in `workspace.cwd`, and save new turns under the same session ID. The hub takes a snapshot when a recipient pulls or someone requests a capture. The discovery response includes a minimal wire example. [Protocol and message examples](docs/agent-protocol.md)
+
 ## CLI and MCP reference
 
 | Task | CLI | MCP tool |
 |---|---|---|
+| Discover and register agents | `agents`, `register-agent` | `list_agents`, `register_agent` |
 | Find a source | `sessions` | `find_sessions` |
 | Preview, publish, inspect | `preview`, `apply`, `status` | `preview_handoff`, `apply_handoff`, `get_handoff` |
 | Freeze and reuse a version | `capture`, `versions`, `prepare` | `capture_version`, `list_versions`, `prepare_handoff` |

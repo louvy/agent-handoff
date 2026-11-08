@@ -49,7 +49,7 @@ pub(crate) fn discover(
             let store = deepseek(cli)?;
             (store.discover()?, store.root)
         }
-        _ => anyhow::bail!("不支持的来源客户端 {agent}"),
+        _ => return crate::protocol::discover(cli, agent),
     };
     let mut warnings = Vec::new();
     let references = items.iter().map(|item| item.reference.clone()).collect();
@@ -171,6 +171,9 @@ pub(crate) fn load_common(
     id: &str,
     bytes: &[u8],
 ) -> Result<txcript::Transcript<txcript::Common>> {
+    if !matches!(agent, "codex" | "claude" | "deepseek") {
+        return crate::protocol::decode(id, bytes);
+    }
     let common = if agent == "deepseek" {
         deepseek(cli)?.read(id)?
     } else {
@@ -184,6 +187,17 @@ pub(crate) fn load_common(
     Ok(common)
 }
 
+pub(crate) fn builtin_target(id: &str) -> bool {
+    matches!(id, "codex" | "claude-desktop" | "deepseek")
+}
+pub(crate) fn check_target(cli: &Cli, id: &str) -> Result<()> {
+    if builtin_target(id) {
+        Ok(())
+    } else {
+        crate::protocol::require(cli, id, "target")
+    }
+}
+
 pub(crate) fn prepare(
     cli: &Cli,
     target_agent: &str,
@@ -192,10 +206,10 @@ pub(crate) fn prepare(
     id: &str,
     target_id: &str,
 ) -> Result<(Vec<u8>, PathBuf)> {
-    ensure!(
-        matches!(target_agent, "codex" | "claude-desktop" | "deepseek"),
-        "不支持的目标客户端"
-    );
+    if !builtin_target(target_agent) {
+        let path = crate::protocol::target(cli, target_agent, target_id)?;
+        return Ok((crate::protocol::encode(common)?, path));
+    }
     let result = match target_agent {
         "deepseek" => deepseek(cli)?.prepare(&common, staging)?,
         "codex" => {
@@ -235,6 +249,14 @@ pub(crate) fn prepare(
     Ok(result)
 }
 pub(crate) fn open(agent: &str, id: &str, cwd: &Path) -> Result<()> {
+    if !builtin_target(agent) {
+        return Err(crate::error::fault(
+            "MANUAL_OPEN_REQUIRED",
+            "由协议接收端打开会话",
+            "读取 target_path，在 workspace.cwd 恢复 target_id。",
+            false,
+        ));
+    }
     if agent == "deepseek" {
         return Err(crate::error::fault(
             "MANUAL_OPEN_REQUIRED",
@@ -280,7 +302,12 @@ pub(crate) fn open(agent: &str, id: &str, cwd: &Path) -> Result<()> {
 }
 
 pub(crate) fn next_action(agent: &str, target_id: &str, plan_id: &str, cwd: &Path) -> String {
-    if agent == "codex" {
+    if !builtin_target(agent) {
+        format!(
+            "由 {agent} 读取 target_path，恢复会话 {target_id}，使用工作目录 {}。",
+            cwd.display()
+        )
+    } else if agent == "codex" {
         format!(
             "打开 codex://threads/{}，核对目录 {}",
             target_id,

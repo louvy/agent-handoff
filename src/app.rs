@@ -22,7 +22,9 @@ use txcript::{
 #[derive(Clone)]
 pub(crate) struct Cli {
     #[arg(long, global = true, env = "HANDOFF_STATE_DIR")]
-    state_dir: Option<PathBuf>,
+    pub(crate) state_dir: Option<PathBuf>,
+    #[arg(skip)]
+    pub(crate) registered: crate::protocol::Registry,
     #[arg(long, global = true)]
     pub(crate) codex_root: Option<PathBuf>,
     #[arg(long, global = true)]
@@ -37,8 +39,19 @@ pub(crate) struct Cli {
 #[derive(Subcommand, Clone)]
 pub(crate) enum Action {
     Mcp,
+    /// Discover built-in and registered local agents.
+    Agents,
+    /// Join the local session exchange using a versioned protocol.
+    RegisterAgent {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        protocol_version: u32,
+    },
     Sessions {
-        #[arg(long, default_value = "codex", value_parser = ["codex", "claude", "deepseek"])]
+        #[arg(long, default_value = "codex")]
         agent: String,
         #[arg(long)]
         project: Option<PathBuf>,
@@ -55,16 +68,16 @@ pub(crate) enum Action {
     },
     Preview {
         source: String,
-        #[arg(long, default_value = "codex", value_parser = ["codex", "claude", "deepseek"])]
+        #[arg(long, default_value = "codex")]
         from: String,
-        #[arg(long, default_value = "claude-desktop", value_parser = ["claude-desktop", "codex", "deepseek"])]
+        #[arg(long, default_value = "claude-desktop")]
         to: String,
         #[arg(long, default_value = "native", value_parser = ["native"])]
         mode: String,
     },
     Capture {
         source: String,
-        #[arg(long, default_value = "codex", value_parser = ["codex", "claude", "deepseek"])]
+        #[arg(long, default_value = "codex")]
         from: String,
     },
     Versions {
@@ -73,7 +86,7 @@ pub(crate) enum Action {
     },
     Prepare {
         version: String,
-        #[arg(long, value_parser = ["codex", "claude-desktop", "deepseek"])]
+        #[arg(long)]
         to: String,
     },
     Assign {
@@ -201,10 +214,9 @@ fn capture(cli: &Cli, db: &mut Connection, source: &str, source_agent: &str) -> 
         .filter(|s| s.meta.id == source || s.reference.to_string_lossy() == source)
         .collect();
     if matches.is_empty() {
-        if warnings
-            .iter()
-            .any(|w| w["source_ref"].as_str() == Some(source))
-        {
+        if warnings.iter().any(|w| {
+            w["source_ref"].as_str() == Some(source) || w["session_id"].as_str() == Some(source)
+        }) {
             return Err(crate::error::fault(
                 "SOURCE_INVALID",
                 "来源会话头无法读取",
@@ -312,7 +324,7 @@ fn digest(bytes: &[u8]) -> String {
 fn home() -> Result<PathBuf> {
     Ok(std::env::var_os("HOME").context("HOME 未设置")?.into())
 }
-fn private_dir(path: &Path) -> Result<()> {
+pub(crate) fn private_dir(path: &Path) -> Result<()> {
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -449,6 +461,7 @@ fn create_plan(
     source_agent: &str,
     target_agent: &str,
 ) -> Result<Value> {
+    crate::agent::check_target(cli, target_agent)?;
     let version = capture(cli, db, source, source_agent)?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let (plan, mut preparation) =
@@ -591,6 +604,12 @@ pub(crate) fn prepare_version(
 pub(crate) fn apply(cli: &Cli, db: &mut Connection, id: &str, open: bool) -> Result<Value> {
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let (plan, status) = load_plan(&tx, id)?;
+    if !crate::agent::builtin_target(&plan.target_agent) {
+        ensure!(
+            crate::protocol::target(cli, &plan.target_agent, &plan.target_id)? == plan.target,
+            crate::error::target_invalid()
+        );
+    }
     let ws = workspace(&plan.workspace.cwd)?;
     ensure!(
         ws.git_dir == plan.workspace.git_dir && ws.root == plan.workspace.root,
@@ -643,10 +662,13 @@ pub(crate) fn apply(cli: &Cli, db: &mut Connection, id: &str, open: bool) -> Res
         ensure!(digest(&bytes) == plan.prepared_digest, "计划产物已变化");
         private_dir(plan.target.parent().context("无目标父目录")?)?;
         if plan.target.exists() {
-            ensure!(
-                fs::read(&plan.target)?.starts_with(&bytes),
-                "目标 ID 已存在且内容不同"
-            );
+            let current = fs::read(&plan.target)?;
+            let matches = if crate::agent::builtin_target(&plan.target_agent) {
+                current.starts_with(&bytes)
+            } else {
+                current == bytes || crate::protocol::continued(&plan.target_id, &bytes, &current)
+            };
+            ensure!(matches, "目标 ID 已存在且内容不同");
         } else {
             // Publish a complete file without overwriting a native session. A crash
             // before publication leaves only this plan's disposable temporary file.
@@ -727,7 +749,7 @@ fn cleanup_orphans(db: &mut Connection, state: &Path) -> Result<()> {
     tx.commit()?;
     Ok(())
 }
-pub(crate) fn run(cli: Cli) -> Result<Value> {
+pub(crate) fn run(mut cli: Cli) -> Result<Value> {
     let state = cli
         .state_dir
         .clone()
@@ -763,7 +785,7 @@ pub(crate) fn run(cli: Cli) -> Result<Value> {
     }
     let mut db = Connection::open_with_flags(database, flags)?;
     db.busy_timeout(std::time::Duration::from_secs(10))?;
-    db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS assignments(id TEXT PRIMARY KEY,body TEXT NOT NULL,plan_id TEXT REFERENCES plans(id)); CREATE TABLE IF NOT EXISTS versions(id TEXT PRIMARY KEY,body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS bindings(project TEXT NOT NULL,path TEXT NOT NULL,PRIMARY KEY(project,path)); CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY,body TEXT NOT NULL,status TEXT NOT NULL);")?;
+    db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS protocol_agents(id TEXT PRIMARY KEY, role TEXT NOT NULL); CREATE TABLE IF NOT EXISTS assignments(id TEXT PRIMARY KEY,body TEXT NOT NULL,plan_id TEXT REFERENCES plans(id)); CREATE TABLE IF NOT EXISTS versions(id TEXT PRIMARY KEY,body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS bindings(project TEXT NOT NULL,path TEXT NOT NULL,PRIMARY KEY(project,path)); CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY,body TEXT NOT NULL,status TEXT NOT NULL);")?;
     {
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch(
@@ -779,7 +801,15 @@ pub(crate) fn run(cli: Cli) -> Result<Value> {
         tx.commit()?;
     }
     cleanup_orphans(&mut db, &state)?;
+    cli.state_dir = Some(state.clone());
+    cli.registered = crate::protocol::registry(&db)?;
     let result = (|| match &cli.command {
+        Action::Agents => Ok(crate::protocol::list(&cli)),
+        Action::RegisterAgent {
+            id,
+            role,
+            protocol_version,
+        } => crate::protocol::register(&cli, &mut db, id, role, *protocol_version),
         Action::Mcp => anyhow::bail!("MCP 入口应由服务端启动"),
         Action::Sessions {
             project,
@@ -882,8 +912,8 @@ pub(crate) fn run(cli: Cli) -> Result<Value> {
             version,
             to,
             instructions,
-        } => crate::assignment::assign(&db, version, to, instructions),
-        Action::Inbox { recipient } => crate::assignment::inbox(&db, recipient),
+        } => crate::assignment::assign(&cli, &db, version, to, instructions),
+        Action::Inbox { recipient } => crate::assignment::inbox(&cli, &db, recipient),
         Action::Claim {
             assignment,
             recipient,

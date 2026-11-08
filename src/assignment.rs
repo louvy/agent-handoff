@@ -14,14 +14,6 @@ struct Assignment {
     created_at: String,
 }
 
-fn check_recipient(recipient: &str) -> Result<()> {
-    ensure!(
-        matches!(recipient, "codex" | "claude-desktop" | "deepseek"),
-        "不支持的接收端"
-    );
-    Ok(())
-}
-
 fn view(db: &Connection, assignment: &Assignment, plan_id: Option<&str>) -> Result<Value> {
     let mut value = serde_json::to_value(assignment)?;
     let plan = plan_id.map(|id| app::plan_view(db, id)).transpose()?;
@@ -34,12 +26,13 @@ fn view(db: &Connection, assignment: &Assignment, plan_id: Option<&str>) -> Resu
 }
 
 pub(crate) fn assign(
+    cli: &Cli,
     db: &Connection,
     version: &str,
     recipient: &str,
     instructions: &str,
 ) -> Result<Value> {
-    check_recipient(recipient)?;
+    crate::agent::check_target(cli, recipient)?;
     ensure!(!instructions.trim().is_empty(), "请提供接手后的具体要求");
     let exists: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM versions WHERE id=?)",
@@ -61,8 +54,8 @@ pub(crate) fn assign(
     view(db, &assignment, None)
 }
 
-pub(crate) fn inbox(db: &Connection, recipient: &str) -> Result<Value> {
-    check_recipient(recipient)?;
+pub(crate) fn inbox(cli: &Cli, db: &Connection, recipient: &str) -> Result<Value> {
+    crate::agent::check_target(cli, recipient)?;
     let mut stmt = db.prepare("SELECT body,plan_id FROM assignments ORDER BY rowid DESC")?;
     let mut items = Vec::new();
     for row in stmt.query_map([], |r| {
@@ -85,7 +78,7 @@ pub(crate) fn claim(
     recipient: &str,
     open: bool,
 ) -> Result<Value> {
-    check_recipient(recipient)?;
+    crate::agent::check_target(cli, recipient)?;
     // Plan creation and assignment ownership commit together. A retry after a
     // crash resumes the committed plan, including a failed or unfinished publish.
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;

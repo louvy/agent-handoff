@@ -19,6 +19,12 @@ The CLI and MCP server are tested against temporary native session stores and re
 - **备份与并发。** 同一状态库的旧备份不会索引后来创建的计划。反复执行版本查询后，三个目标计划的文件清单及摘要保持一致；放回最新库后，三个原 ID 均可发布并回读。还覆盖数据库缺失、事务回滚、并发领取、准备期间中断和提交结果不明时的目录保留。
 - **兼容范围。** Codex 和 Claude 使用未压缩 JSONL；DeepSeek 使用 Harness 0.2.2-rc.1 的 v4 格式。模型私有状态、媒体跨端保真、其他 SDK 版本及其他操作系统需单独验证。
 
+## 自主接入验收
+
+独立 Python 客户端在仓库外的临时目录启动，通过 CLI 注册双向角色。已运行的 stdio MCP 服务能发现该注册并向它指派 Codex 版本。客户端从原 worktree 读取分支和仅该工作树包含的文件内容，把结果写回目标会话。随后从 MCP 主动拉取续写到 Claude 的原生存储，核对父计划、历史、工具结果、笔记和指派要求。此项覆盖协议文件消费和原生存储交付，Claude 的前台窗口由前述桌面验收覆盖。
+
+同组测试还覆盖两个外部 agent 之间的交接、重复及并发注册、角色越权、版本不兼容、标识冲突、损坏记录、缺失工作目录、符号链接、接收目录恢复后复用指派，以及发布中断后保留新增消息。[协议用例](../tests/m8_protocol.py)
+
 ## Reproduce / 本地复现
 
 Start from the repository root on macOS with Git, Rust 1.96+, Python 3 and zstd. The full suite requires Node.js 24.9+ and the tested Harness package on PATH. For example, install the SDK with `npm install --global @deepseek-ai/dsh@0.2.2-rc.1`.
@@ -30,6 +36,6 @@ python3 -m unittest discover -s tests -p 'm*.py' -v
 python3 tests/acceptance_matrix.py
 ```
 
-The regression suite contains 36 tests. The matrix runs 63 checks and observations, including the 12 cross-client pull and assignment flows. It writes a JSON report to stdout. The commands use isolated fixture data; no live conversations or credentials are required.
+The regression suite contains 39 tests. The matrix runs 63 checks and observations, including the 12 cross-client pull and assignment flows. It writes a JSON report to stdout. The commands use isolated fixture data; no live conversations or credentials are required.
 
 Use [the backup and recovery tests](../tests/m7_boundaries.py) for the database restore scenarios. To reproduce the manual worktree check, run `python3 scripts/m0_fixture.py` to generate a disposable repository and native-test inputs under the ignored `.m0` directory. After continuing a task in the real target client, use `python3 scripts/m0_verify.py --help` to check an exported native transcript against that fixture.

@@ -150,7 +150,7 @@ class McpTests(unittest.TestCase):
         self.assertEqual({x['name'] for x in names}, {
             'find_sessions', 'preview_handoff', 'apply_handoff', 'get_handoff', 'read_context',
             'capture_version', 'list_versions', 'prepare_handoff',
-            'assign_version', 'list_assignments', 'claim_assignment'})
+            'assign_version', 'list_assignments', 'claim_assignment', 'list_agents', 'register_agent'})
         sessions = self.call('find_sessions', {'agent': 'codex', 'project': str(self.fixture.work)})
         self.assertEqual(sessions, self.fixture.cli('sessions', '--project', str(self.fixture.work)))
         first = self.call('preview_handoff', {'source_ref': 'source-id', 'target': 'claude-desktop'})

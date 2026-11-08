@@ -14,8 +14,16 @@ struct HandoffServer {
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct Register {
+    id: String,
+    /// source, target or both
+    role: String,
+    protocol_version: u32,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct Find {
-    /// codex, claude or deepseek
+    /// Source ID from list_agents
     agent: Option<String>,
     project: Option<std::path::PathBuf>,
     query: Option<String>,
@@ -26,9 +34,9 @@ struct Find {
 #[serde(deny_unknown_fields)]
 struct Preview {
     source_ref: String,
-    /// codex, claude or deepseek; defaults to codex
+    /// Source ID from list_agents; defaults to codex
     source_agent: Option<String>,
-    /// claude-desktop, codex or deepseek
+    /// Target ID from list_agents
     target: String,
     /// native is supported
     mode: Option<String>,
@@ -99,6 +107,21 @@ impl HandoffServer {
 }
 #[tool_router]
 impl HandoffServer {
+    #[tool(description = "列出可用 agent、来源和接收端标识及支持的接入协议版本")]
+    async fn list_agents(&self) -> CallToolResult {
+        self.execute(Action::Agents).await
+    }
+    #[tool(
+        description = "自主接入本机协议。版本 1 使用独立的 sessions_dir 和每会话一个 JSON 文件，重复注册返回同一目录。"
+    )]
+    async fn register_agent(&self, Parameters(p): Parameters<Register>) -> CallToolResult {
+        self.execute(Action::RegisterAgent {
+            id: p.id,
+            role: p.role,
+            protocol_version: p.protocol_version,
+        })
+        .await
+    }
     #[tool(
         description = "将已保存版本指派给指定接收端并持久化后续要求；成功表示待领取，接收端可以离线"
     )]
@@ -153,7 +176,7 @@ impl HandoffServer {
         .await
     }
     #[tool(
-        description = "查找本地 Codex、Claude 或 DeepSeek 会话。query 为 ID、标题或可见正文的原样子串。返回 total、next_cursor，下一页将 next_cursor 作为 offset。候选有歧义时先让用户选择，返回精确来源引用和工作目录",
+        description = "查找内置或已注册来源的本地会话。query 为 ID、标题或可见正文的原样子串。返回 total、next_cursor，下一页将 next_cursor 作为 offset。候选有歧义时先让用户选择，返回精确来源引用和工作目录",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn find_sessions(&self, Parameters(p): Parameters<Find>) -> CallToolResult {

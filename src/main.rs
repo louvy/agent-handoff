@@ -4,6 +4,7 @@ mod assignment;
 mod deepseek;
 mod error;
 mod mcp;
+mod protocol;
 use clap::Parser;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

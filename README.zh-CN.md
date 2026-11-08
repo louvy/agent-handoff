@@ -88,10 +88,22 @@ handoff claim ASSIGNMENT_ID --recipient deepseek
 
 也可以直接用 `handoff prepare VERSION_ID --to TARGET` 从已保存的版本生成计划，再执行 `handoff apply PLAN_ID`。项目约定可以写入 Markdown，在创建快照**之前**运行 `handoff memory bind --project . --path ./NOTES.md`。绑定笔记的正文会进入目标会话。
 
+## 让你的 agent 自主接入
+
+在本机运行的 agent 可以通过 CLI 或 stdio MCP 注册，角色可选 `source`、`target` 或 `both`。注册立即生效，无需修改中转站源码。
+
+```sh
+handoff agents
+handoff register-agent --id example-agent --role both --protocol-version 1
+```
+
+来源端在返回的 `sessions_dir` 中提供协议 JSON 文件，接收方拉取时才生成版本。接收端读取交付的 `target_path`，在 `workspace.cwd` 恢复消息并用同一会话 ID 保存续写。已有私有存储的客户端可以在自己一侧转换格式。[接入协议与消息样例](docs/agent-protocol.md)
+
 ## CLI 与 MCP 接口
 
 | 操作 | CLI | MCP 工具 |
 |---|---|---|
+| 发现与自主注册 | `agents`, `register-agent` | `list_agents`, `register_agent` |
 | 查找来源会话 | `sessions` | `find_sessions` |
 | 预览、发布、查状态 | `preview`、`apply`、`status` | `preview_handoff`、`apply_handoff`、`get_handoff` |
 | 保存及复用独立版本 | `capture`、`versions`、`prepare` | `capture_version`、`list_versions`、`prepare_handoff` |
