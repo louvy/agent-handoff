@@ -1,16 +1,17 @@
 use serde_json::{Value, json};
 use std::fmt;
 
-#[derive(Debug)]
+#[derive(Debug, serde::Deserialize)]
 pub(crate) struct Fault {
-    code: &'static str,
-    message: &'static str,
-    next_action: &'static str,
+    code: String,
+    #[serde(rename = "error")]
+    message: String,
+    next_action: String,
     retryable: bool,
 }
 impl fmt::Display for Fault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.message)
+        f.write_str(&self.message)
     }
 }
 impl std::error::Error for Fault {}
@@ -22,13 +23,18 @@ pub(crate) fn fault(
     retryable: bool,
 ) -> anyhow::Error {
     Fault {
-        code,
-        message,
-        next_action,
+        code: code.into(),
+        message: message.into(),
+        next_action: next_action.into(),
         retryable,
     }
     .into()
 }
+// Discovery warnings already carry the public, classified failure.
+pub(crate) fn from_response(value: &Value) -> Result<anyhow::Error, serde_json::Error> {
+    Ok(serde_json::from_value::<Fault>(value.clone())?.into())
+}
+
 pub(crate) fn response(error: &anyhow::Error) -> Value {
     if let Some(inner) = error.downcast_ref::<anyhow::Error>() {
         return response(inner);

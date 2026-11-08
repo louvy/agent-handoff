@@ -1,4 +1,5 @@
 """An independent local client joins through public CLI/MCP and resumes in a worktree."""
+import copy
 import concurrent.futures
 import json
 import os
@@ -160,3 +161,94 @@ else:
         published = f.cli('apply',plan['id'])
         self.assertEqual(json.loads(target.read_text()), existing)
         self.assertEqual(json.loads(Path(published['target_path']).read_text())['meta']['cwd'],str(f.work))
+
+    def test_delivered_history_must_survive_retry(self):
+        f = self.f
+        self.register('receiver', 'target')
+        version = f.cli('capture', 'source-id')
+        assignment = f.cli('assign', version['id'], '--to', 'receiver',
+                           '--instructions', 'keep the assignment requirement')
+        claim = {'assignment_id': assignment['id'], 'recipient': 'receiver'}
+        plan = self.call('claim_assignment', claim)['plan']
+        target = Path(plan['target_path'])
+        original = json.loads(target.read_text())
+        variants = {
+            'truncated': original['messages'][:1],
+            'missing_first_turn': original['messages'][1:],
+            'rewritten_history': copy.deepcopy(original['messages']),
+            'rewritten_tool_output': copy.deepcopy(original['messages']),
+            'missing_briefing': original['messages'][:-1],
+        }
+        variants['rewritten_history'][0]['content'][0]['text'] = 'replacement history'
+        results = [block for msg in variants['rewritten_tool_output'] for block in msg['content']
+                   if block['type'] == 'tool_result']
+        self.assertTrue(results)
+        results[0]['content'] = 'replacement output'
+        for name, messages in variants.items():
+            with self.subTest(name=name):
+                changed = {**original, 'messages': messages}
+                target.write_text(json.dumps(changed))
+                saved = target.read_bytes()
+                self.assertEqual(json.loads(f.cli('apply', plan['id'], ok=False))['code'],
+                                 'TARGET_INVALID')
+                self.assertEqual(self.call('claim_assignment', claim, ok=False)['code'],
+                                 'TARGET_INVALID')
+                self.assertEqual(json.loads(f.cli('claim', assignment['id'], '--recipient',
+                                                 'receiver', ok=False))['code'], 'TARGET_INVALID')
+                self.assertEqual(self.call('apply_handoff', {'plan_id': plan['id']},
+                                          ok=False)['code'], 'TARGET_INVALID')
+                self.assertEqual(target.read_bytes(), saved)
+                self.assertEqual(f.cli('status', plan['id'])['target_id'], plan['target_id'])
+        continued = copy.deepcopy(original)
+        continued['meta']['title'] = 'client updated title'
+        continued['messages'].append({
+            'role': 'assistant', 'timestamp': '2026-01-01T00:00:00Z',
+            'content': [{'type': 'text', 'text': 'new client progress'}]})
+        target.write_text(json.dumps(continued, indent=2))
+        saved = target.read_bytes()
+        self.assertEqual(f.cli('claim', assignment['id'], '--recipient', 'receiver')
+                         ['plan']['target_id'], plan['target_id'])
+        self.assertEqual(self.call('apply_handoff', {'plan_id': plan['id']})['target_id'],
+                         plan['target_id'])
+        self.assertEqual(target.read_bytes(), saved)
+
+    @unittest.skipIf(os.geteuid() == 0, 'permission checks require an unprivileged user')
+    def test_unreadable_source_preserves_issue_and_recovers(self):
+        f = self.f
+        self.register('portable')
+        version = f.cli('capture', 'source-id')
+        assignment = f.cli('assign', version['id'], '--to', 'portable',
+                           '--instructions', 'continue after restoring access')
+        plan = f.cli('claim', assignment['id'], '--recipient', 'portable')['plan']
+        path = Path(plan['target_path'])
+        original = path.read_bytes()
+        path.chmod(0)
+        try:
+            listing = self.call('find_sessions', {'agent': 'portable'})
+            issue = listing['warnings'][0]['issue']
+            self.assertEqual(issue['code'], 'ACCESS_DENIED')
+            self.assertTrue(issue['retryable'])
+            for ref in (plan['target_id'], str(path)):
+                with self.subTest(ref=ref):
+                    self.assertEqual(self.call('capture_version', {
+                        'source_agent': 'portable', 'source_ref': ref}, ok=False), issue)
+                    self.assertEqual(json.loads(f.cli('capture', ref, '--from', 'portable',
+                                                     ok=False)), issue)
+                    self.assertEqual(self.call('preview_handoff', {
+                        'source_agent': 'portable', 'source_ref': ref,
+                        'target': 'codex'}, ok=False), issue)
+            self.assertEqual(self.call('capture_version', {
+                'source_agent': 'portable', 'source_ref': 'absent'}, ok=False)['code'],
+                'SESSION_NOT_FOUND')
+        finally:
+            path.chmod(0o600)
+        self.assertEqual(self.call('claim_assignment', {
+            'assignment_id': 'absent', 'recipient': 'portable'}, ok=False)['code'],
+            'ASSIGNMENT_NOT_FOUND')
+        captured = f.cli('capture', plan['target_id'], '--from', 'portable')
+        self.assertEqual(captured['parent_plan_id'], plan['id'])
+        self.assertEqual(path.read_bytes(), original)
+        restored = self.call('claim_assignment', {
+            'assignment_id': assignment['id'], 'recipient': 'portable'})['plan']
+        self.assertEqual(restored['target_id'], plan['target_id'])
+        self.assertEqual(path.read_bytes(), original)

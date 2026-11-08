@@ -226,15 +226,10 @@ fn capture(cli: &Cli, db: &mut Connection, source: &str, source_agent: &str) -> 
         .filter(|s| s.meta.id == source || s.reference.to_string_lossy() == source)
         .collect();
     if matches.is_empty() {
-        if warnings.iter().any(|w| {
+        if let Some(warning) = warnings.iter().find(|w| {
             w["source_ref"].as_str() == Some(source) || w["session_id"].as_str() == Some(source)
         }) {
-            return Err(crate::error::fault(
-                "SOURCE_INVALID",
-                "来源会话头无法读取",
-                "修复该来源记录，或选择中转站已保存版本。",
-                false,
-            ));
+            return Err(crate::error::from_response(&warning["issue"])?);
         }
         return Err(crate::error::fault(
             "SESSION_NOT_FOUND",
@@ -661,6 +656,14 @@ pub(crate) fn apply(cli: &Cli, db: &mut Connection, id: &str, open: bool) -> Res
             &plan.target,
             &plan.workspace.cwd,
         )?;
+        if !crate::agent::builtin_target(&plan.target_agent) {
+            let prepared = fs::read(&plan.prepared)?;
+            ensure!(digest(&prepared) == plan.prepared_digest, "计划产物已变化");
+            ensure!(
+                crate::protocol::continued(&plan.target_id, &prepared, &fs::read(&plan.target)?),
+                crate::error::target_invalid()
+            );
+        }
     }
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     if status == "previewed" {

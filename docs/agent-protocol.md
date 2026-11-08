@@ -46,7 +46,7 @@ tmp.write_text(json.dumps(session, ensure_ascii=False), encoding="utf-8")
 tmp.replace(directory / "issue-42.json")
 ```
 
-`meta.timestamp` 与每条消息的 `timestamp` 均为 RFC 3339 时间。接手需要现存 Git worktree 下的绝对 `cwd`，包括原会话使用的子目录。`meta.title` 可选。消息按时间顺序保存，至少有一条。角色为 `user` 或 `assistant`。`content` 为有序块数组。文本块如上，历史工具调用与结果可按下面的方式配对。完整的块、工具和可选元数据字段使用 txcript 0.14.4 的 `common::{Meta, Message, Block}` 序列化格式。接收端应在续写时保留已有消息和结构化块。工具调用仅供回顾。
+`meta.timestamp` 与每条消息的 `timestamp` 均为 RFC 3339 时间。接手需要现存 Git worktree 下的绝对 `cwd`，包括原会话使用的子目录。`meta.title` 可选。消息按时间顺序保存，至少有一条。角色为 `user` 或 `assistant`。`content` 为有序块数组。文本块如上，历史工具调用与结果可按下面的方式配对。完整的块、工具和可选元数据字段使用 txcript 0.14.4 的 `common::{Meta, Message, Block}` 序列化格式。接收端应在续写时完整保留已有消息和结构化块，仅在末尾追加。重复 apply 或 claim 会与交付时的消息前缀比较；删减、改写或丢失笔记及指派要求返回 TARGET_INVALID。允许修改标题和 JSON 排版。工具调用仅供回顾。
 
 ```json
 [

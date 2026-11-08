@@ -25,6 +25,20 @@ The CLI and MCP server are tested against temporary native session stores and re
 
 同组测试还覆盖两个外部 agent 之间的交接、重复及并发注册、角色越权、版本不兼容、标识冲突、损坏记录、缺失工作目录、符号链接、接收目录恢复后复用指派，以及发布中断后保留新增消息。[协议用例](../tests/m8_protocol.py)
 
+## 自主接入缺口修复复验
+
+本轮以 `6a1b21f` 为修复基线。新增两个回归用例先复现了历史不完整仍放行、权限错误被重分类的问题。
+
+| 场景 | 完成判据 |
+|---|---|
+| 已发布的外部会话被截断、删除首条消息、改写正文或工具结果、删除交接要求 | CLI/MCP 的 apply 和 claim 均返回 `TARGET_INVALID`，保留现有目标和原计划 ID。 |
+| 恢复完整历史，追加消息并修改标题和 JSON 排版 | 原指派与计划继续可用，已追加进度保持完整。 |
+| 外部来源会话暂时不可读 | 按 ID 或精确路径调用 capture，或通过 MCP preview 拉取，返回与 find_sessions 警告相同的 `ACCESS_DENIED`、恢复指引和可重试性。 |
+| 恢复读取权限 | 可重新采集同一来源，原指派领取继续复用目标 ID 和内容。 |
+| 外部 agent 与三个内置端双向交接 | 主动拉取和离线指派共 12 条链路核对父计划、原 worktree、历史、工具结果、笔记和后续要求。 |
+
+本轮自动化复验覆盖真实 CLI、stdio MCP 和本地会话存储，未重新执行前台窗口恢复操作。
+
 ## Reproduce / 本地复现
 
 Start from the repository root on macOS with Git, Rust 1.96+, Python 3 and zstd. The full suite requires Node.js 24.9+ and the tested Harness package on PATH. For example, install the SDK with `npm install --global @deepseek-ai/dsh@0.2.2-rc.1`.
@@ -36,6 +50,6 @@ python3 -m unittest discover -s tests -p 'm*.py' -v
 python3 tests/acceptance_matrix.py
 ```
 
-The regression suite contains 39 tests. The matrix runs 63 checks and observations, including the 12 cross-client pull and assignment flows. It writes a JSON report to stdout. The commands use isolated fixture data; no live conversations or credentials are required.
+The regression suite contains 44 tests. The matrix runs 63 checks and observations, including the 12 cross-client pull and assignment flows. It writes a JSON report to stdout. The commands use isolated fixture data; no live conversations or credentials are required.
 
 Use [the backup and recovery tests](../tests/m7_boundaries.py) for the database restore scenarios. To reproduce the manual worktree check, run `python3 scripts/m0_fixture.py` to generate a disposable repository and native-test inputs under the ignored `.m0` directory. After continuing a task in the real target client, use `python3 scripts/m0_verify.py --help` to check an exported native transcript against that fixture.
