@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import time
 from unittest.mock import patch
 
 import m2_mcp
@@ -243,10 +244,20 @@ def run(server):
         sdk_server.tearDown()
     with sqlite3.connect(f.root / 'state/handoff.sqlite3') as db:
         db.execute('BEGIN IMMEDIATE')
+        started = time.monotonic()
         cli_error = json.loads(cli('capture', ids['codex'], ok=False))
+        cli_seconds = time.monotonic() - started
+        started = time.monotonic()
+        # SQLite deliberately waits up to 10 seconds per lock acquisition.
+        # Leave room for lock retries and runner scheduling in this negative case.
         assert cli_error == call('capture_version', {
-            'source_agent': 'codex', 'source_ref': ids['codex']}, ok=False)
-        record('state-busy', cli_error)
+            'source_agent': 'codex', 'source_ref': ids['codex']}, ok=False, timeout=30)
+        record('state-busy', cli_error, cli_seconds=round(cli_seconds, 2),
+               mcp_seconds=round(time.monotonic() - started, 2))
+    recovered = call('capture_version', {
+        'source_agent': 'codex', 'source_ref': ids['codex']})
+    assert recovered['source_id'] == ids['codex']
+    record('state-busy-recovered', 'pass')
     state = f.root / 'state/handoff.sqlite3'
     state.write_bytes(b'invalid test database')
     result = call('list_versions', {}, ok=False)

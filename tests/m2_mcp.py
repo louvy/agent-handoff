@@ -59,16 +59,16 @@ class McpTests(unittest.TestCase):
         self.process.stdin.flush()
         return self.sequence
 
-    def receive(self, request_id):
+    def receive(self, request_id, timeout=15):
         while request_id not in self.pending:
-            response = self.responses.get(timeout=15)
+            response = self.responses.get(timeout=timeout)
             self.assertIsInstance(response, dict, response)
             if 'id' in response:
                 self.pending[response['id']] = response
         return self.pending.pop(request_id)
 
-    def call(self, name, arguments, ok=True):
-        response = self.receive(self.send('tools/call', {'name': name, 'arguments': arguments}))
+    def call(self, name, arguments, ok=True, timeout=15):
+        response = self.receive(self.send('tools/call', {'name': name, 'arguments': arguments}), timeout=timeout)
         self.assertNotIn('error', response, response)
         result = response['result']
         self.assertEqual(bool(result.get('isError')), not ok, result)

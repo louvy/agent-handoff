@@ -50,6 +50,6 @@ python3 -m unittest discover -s tests -p 'm*.py' -v
 python3 tests/acceptance_matrix.py
 ```
 
-The regression suite contains 44 tests. The matrix runs 63 checks and observations, including the 12 cross-client pull and assignment flows. It writes a JSON report to stdout. The commands use isolated fixture data; no live conversations or credentials are required.
+The regression suite contains 44 tests. The matrix runs 64 checks and observations, including the 12 cross-client pull and assignment flows. It writes a JSON report to stdout. The held-database-lock case allows 30 seconds for its MCP response, records CLI/MCP elapsed times, and verifies capture succeeds after the lock is released. Other requests retain the default 15-second timeout. The commands use isolated fixture data; no live conversations or credentials are required.
 
 Use [the backup and recovery tests](../tests/m7_boundaries.py) for the database restore scenarios. To reproduce the manual worktree check, run `python3 scripts/m0_fixture.py` to generate a disposable repository and native-test inputs under the ignored `.m0` directory. After continuing a task in the real target client, use `python3 scripts/m0_verify.py --help` to check an exported native transcript against that fixture.
