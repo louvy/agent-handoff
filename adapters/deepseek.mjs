@@ -132,13 +132,16 @@ async function run() {
     try { await handle.append(events); await handle.flush(); }
     finally { await handle.close(); }
     const check = await store.open(header.id, 'read');
+    let delivered;
     try {
         const replay = await check.read();
-        Session.fromRestore(header.id, replay.events, check.header, check.inheritedEventCount, replay.eventState).deriveMessages();
+        delivered = Session.fromRestore(header.id, replay.events, check.header, check.inheritedEventCount, replay.eventState)
+            .deriveMessages().map(toSimple);
     }
     finally { await check.close(); }
     const stat = await store.stat(header.id);
-    return { path: stat.location.path, id: header.id };
+    return { path: stat.location.path, id: header.id, cwd: header.cwd,
+        timestamp: new Date(header.createdAt).toISOString(), messages: delivered };
 }
 try { process.stdout.write(JSON.stringify(await run()) + '\n'); }
 finally { await scope.dispose(); }

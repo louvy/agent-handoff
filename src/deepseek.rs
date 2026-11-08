@@ -200,11 +200,12 @@ impl DeepSeek {
         &self,
         common: &Transcript<Common>,
         staging: &Path,
-    ) -> Result<(Vec<u8>, PathBuf)> {
+    ) -> Result<(Vec<u8>, PathBuf, Transcript<Common>)> {
         let simple = Simple::to_text(&Simple::from_common(common)?)?;
         let value = self.call(json!({"op":"prepare","root":staging,"transcript":serde_json::from_str::<Value>(&simple)?}))?;
         let file: PathBuf = serde_json::from_value(value["path"].clone())?;
         let target = self.root.join(file.strip_prefix(staging)?);
-        Ok((fs::read(file)?, target))
+        let delivered = Simple::to_common(&Simple::from_text(&serde_json::to_string(&value)?)?)?;
+        Ok((fs::read(file)?, target, delivered))
     }
 }
