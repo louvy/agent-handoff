@@ -25,5 +25,6 @@ jobs:
         run: |
           cargo +stable fmt --check
           cargo +stable build --locked
+          cargo +stable test --locked
           python3 -m unittest discover -s tests -p 'm*.py' -v
           python3 tests/acceptance_matrix.py

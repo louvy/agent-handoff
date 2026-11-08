@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -358,6 +359,8 @@ struct RestoreJournal {
     state: PathBuf,
     staged: PathBuf,
     rollback: PathBuf,
+    #[serde(default)]
+    protocol_modes: BTreeMap<PathBuf, u32>,
 }
 fn persist_journal(path: &Path, journal: &RestoreJournal) -> Result<()> {
     let temp = tempfile::NamedTempFile::new_in(path.parent().context("无日志父目录")?)?;
@@ -367,6 +370,77 @@ fn persist_journal(path: &Path, journal: &RestoreJournal) -> Result<()> {
     fs::File::open(path.parent().context("无日志父目录")?)?.sync_all()?;
     Ok(())
 }
+fn restore_protocol_modes(root: &Path, modes: &BTreeMap<PathBuf, u32>) -> Result<()> {
+    for (rel, mode) in modes.iter().rev() {
+        ensure!(
+            rel.starts_with("agents")
+                && rel.components().all(|c| matches!(c, Component::Normal(_))),
+            fault("STATE_INVALID", "协议权限日志路径无效")
+        );
+        let path = root.join(rel);
+        if path.exists() {
+            ensure!(
+                fs::symlink_metadata(&path)?.is_dir(),
+                fault("RESTORE_CONFLICT", "协议目录类型发生变化")
+            );
+            fs::set_permissions(&path, fs::Permissions::from_mode(*mode))?;
+            fs::File::open(path)?.sync_all()?;
+        }
+    }
+    Ok(())
+}
+fn freeze_protocol(dir: &Path, journal: &mut RestoreJournal, path: &Path) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(dir)?;
+    ensure!(
+        metadata.is_dir(),
+        fault("RESTORE_CONFLICT", "协议目录必须为真实目录")
+    );
+    let rel = dir.strip_prefix(&journal.state)?.to_path_buf();
+    let mode = metadata.permissions().mode();
+    journal.protocol_modes.insert(rel, mode);
+    // Persist recovery information before changing a live directory's mode.
+    persist_journal(path, journal)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(mode & !0o222))?;
+    let name = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())?;
+    let writable =
+        unsafe { libc::faccessat(libc::AT_FDCWD, name.as_ptr(), libc::W_OK, libc::AT_EACCESS) }
+            == 0;
+    ensure!(
+        !writable,
+        crate::error::fault(
+            "RESTORE_CONFLICT",
+            "协议目录的原子发布权限无法冻结",
+            "请以目录所属普通用户执行恢复，并核对目录访问权限。",
+            true
+        )
+    );
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            freeze_protocol(&entry.path(), journal, path)?;
+        }
+    }
+    Ok(())
+}
+fn discard_protocol_temps(staged: &Path) -> Result<()> {
+    let root = staged.join("agents");
+    for (rel, _) in inventory(&root)? {
+        if rel.extension().is_none_or(|extension| extension != "json") {
+            fs::remove_file(root.join(rel))?;
+        }
+    }
+    Ok(())
+}
+#[derive(Clone, Copy)]
+enum RestorePhase {
+    BeforeFreeze,
+    Frozen,
+    Activated,
+}
+
 // Caller holds the stable sibling writer lock. Queries never repair state.
 pub(crate) fn recover_restore(state: &Path) -> Result<()> {
     let path = control_path(state, "restore.json")?;
@@ -389,8 +463,12 @@ pub(crate) fn recover_restore(state: &Path) -> Result<()> {
                 .is_some_and(|n| n.to_string_lossy().starts_with("handoff-rollback-")),
         fault("STATE_INVALID", "恢复日志路径不属于当前状态目录")
     );
+    let installed = state.exists() && !journal.staged.exists();
     if !state.exists() && journal.rollback.exists() {
         fs::rename(&journal.rollback, state)?;
+    }
+    if !installed {
+        restore_protocol_modes(state, &journal.protocol_modes)?;
     }
     if journal.staged.exists() {
         fs::remove_dir_all(&journal.staged)?;
@@ -454,6 +532,15 @@ pub(crate) fn restore(
     path: &Path,
     seconds: u64,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Value> {
+    restore_with_hook(state, path, seconds, cancelled, |_, _| Ok(()))
+}
+fn restore_with_hook(
+    state: &Path,
+    path: &Path,
+    seconds: u64,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+    mut hook: impl FnMut(RestorePhase, &Path) -> Result<()>,
 ) -> Result<Value> {
     let source = path.canonicalize()?;
     ensure!(
@@ -667,22 +754,61 @@ pub(crate) fn restore(
     }
     fs::File::open(staged.path())?.sync_all()?;
     let staged = staged.keep();
-    let journal = RestoreJournal {
+    let mut journal = RestoreJournal {
         state: state.into(),
         staged: staged.clone(),
         rollback: rollback.clone(),
+        protocol_modes: BTreeMap::new(),
     };
     persist_journal(&control_path(state, "restore.json")?, &journal)?;
     let had_state = state.exists();
     let mut moved_original = false;
     let mut installed = false;
     let activation = (|| -> Result<()> {
+        hook(RestorePhase::BeforeFreeze, state)?;
+        freeze_protocol(
+            &state.join("agents"),
+            &mut journal,
+            &control_path(state, "restore.json")?,
+        )?;
+        hook(RestorePhase::Frozen, state)?;
+        ensure!(
+            before
+                == if state.exists() {
+                    inventory(state)?
+                } else {
+                    BTreeMap::new()
+                },
+            crate::error::fault(
+                "RESTORE_CHANGED",
+                "恢复切换前协议会话发生变化",
+                "使用原备份重试，客户端写入已保留。",
+                true
+            )
+        );
+        // Existing directory handles cannot publish into the retired tree.
+        // Temp files belong to the client operation that created them. Copying
+        // their names into the new tree could make a late rename publish stale bytes.
+        discard_protocol_temps(&staged)?;
+        for rel in journal.protocol_modes.keys() {
+            ensure!(
+                staged.join(rel).is_dir(),
+                crate::error::fault(
+                    "RESTORE_CHANGED",
+                    "协议目录在恢复期间发生变化",
+                    "稍后重试恢复。",
+                    true
+                )
+            );
+        }
+        restore_protocol_modes(&staged, &journal.protocol_modes)?;
         if had_state {
             fs::rename(state, &rollback)?;
             moved_original = true;
         }
         fs::rename(&staged, state)?;
         installed = true;
+        hook(RestorePhase::Activated, state)?;
         fs::File::open(parent)?.sync_all()?;
         fs::remove_file(control_path(state, "restore.json")?)?;
         fs::File::open(parent)?.sync_all()?;
@@ -695,6 +821,7 @@ pub(crate) fn restore(
         if moved_original {
             fs::rename(&rollback, state)?;
         }
+        restore_protocol_modes(state, &journal.protocol_modes)?;
         if staged.exists() {
             fs::remove_dir_all(&staged)?;
         }
@@ -969,4 +1096,181 @@ pub(crate) fn recover_gc(db: &Connection, state: &Path) -> Result<()> {
         fs::remove_dir_all(entry.path())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use std::io::Write;
+
+    struct Fixture {
+        _root: tempfile::TempDir,
+        state: PathBuf,
+        saved: PathBuf,
+        session: PathBuf,
+    }
+    fn session(progress: bool) -> Vec<u8> {
+        let mut messages = vec![
+            json!({"role":"user","timestamp":"2026-11-09T00:00:00Z","content":[{"type":"text","text":"original"}]}),
+        ];
+        if progress {
+            messages.push(json!({"role":"assistant","timestamp":"2026-11-09T00:00:01Z","content":[{"type":"text","text":"concurrent-agent-progress"}]}));
+        }
+        serde_json::to_vec(&json!({"protocol_version":1,"meta":{"id":"session","cwd":"/tmp","timestamp":"2026-11-09T00:00:00Z"},"messages":messages})).unwrap()
+    }
+    impl Fixture {
+        fn new(with_temp: bool) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let state = root.path().join("state");
+            let cli = crate::app::Cli::try_parse_from([
+                "handoff",
+                "--state-dir",
+                state.to_str().unwrap(),
+                "register-agent",
+                "--id",
+                "concurrent",
+                "--role",
+                "both",
+                "--protocol-version",
+                "1",
+            ])
+            .unwrap();
+            crate::app::run(cli).unwrap();
+            let path = state.join("agents/concurrent/session.json");
+            fs::write(&path, session(false)).unwrap();
+            if with_temp {
+                fs::write(path.with_extension("tmp"), session(false)).unwrap();
+            }
+            let saved = root.path().join("saved");
+            let mut db = Connection::open(state.join("handoff.sqlite3")).unwrap();
+            backup(&mut db, &state, &saved).unwrap();
+            drop(db);
+            Self {
+                _root: root,
+                state,
+                saved,
+                session: path,
+            }
+        }
+        fn writer(&self) -> std::process::Output {
+            std::process::Command::new("python3")
+                .args(["-c", "import pathlib,sys; p=pathlib.Path(sys.argv[1]); t=p.with_suffix('.write-tmp'); t.write_text(sys.argv[2]); t.replace(p)"])
+                .arg(&self.session).arg(String::from_utf8(session(true)).unwrap())
+                .output().unwrap()
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fn writable(path: &Path) {
+                if let Ok(meta) = fs::symlink_metadata(path) {
+                    if meta.is_dir() {
+                        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+                        for entry in fs::read_dir(path).unwrap() {
+                            writable(&entry.unwrap().path());
+                        }
+                    }
+                }
+            }
+            writable(self._root.path());
+        }
+    }
+    #[test]
+    fn successful_publish_in_last_window_aborts_restore_without_losing_messages() {
+        let fixture = Fixture::new(false);
+        let expected_mode = fs::metadata(fixture.session.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        let result = restore_with_hook(&fixture.state, &fixture.saved, 5, None, |phase, _| {
+            if matches!(phase, RestorePhase::BeforeFreeze) {
+                let output = fixture.writer();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Ok(())
+        });
+        let issue = crate::error::response(&result.unwrap_err());
+        assert_eq!(issue["code"], "RESTORE_CHANGED");
+        assert_eq!(issue["retryable"], true);
+        assert_eq!(fs::read(&fixture.session).unwrap(), session(true));
+        assert_eq!(
+            fs::metadata(fixture.session.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode(),
+            expected_mode
+        );
+        // The same backup can be retried, retaining the newer legal continuation.
+        restore(&fixture.state, &fixture.saved, 5, None).unwrap();
+        assert_eq!(fs::read(&fixture.session).unwrap(), session(true));
+    }
+    #[test]
+    fn frozen_publish_and_old_temp_handle_fail_explicitly_then_retry_succeeds() {
+        let fixture = Fixture::new(true);
+        let temp = fixture.session.with_extension("tmp");
+        let mut old_handle = fs::OpenOptions::new().write(true).open(&temp).unwrap();
+        let restored = restore_with_hook(&fixture.state, &fixture.saved, 5, None, |phase, _| {
+            if matches!(phase, RestorePhase::Frozen) {
+                assert_eq!(
+                    fs::metadata(fixture.session.parent().unwrap())
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o222,
+                    0
+                );
+                assert!(!fixture.writer().status.success());
+            }
+            if matches!(phase, RestorePhase::Activated) {
+                old_handle.set_len(0)?;
+                old_handle.write_all(&session(true))?;
+                assert_eq!(
+                    fs::rename(&temp, &fixture.session).unwrap_err().kind(),
+                    std::io::ErrorKind::NotFound
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(fs::read(&fixture.session).unwrap(), session(false));
+        let retired = PathBuf::from(restored["rollback_state"].as_str().unwrap());
+        assert_eq!(
+            fs::metadata(retired.join("agents/concurrent"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o222,
+            0
+        );
+        assert!(fixture.writer().status.success());
+        assert_eq!(fs::read(&fixture.session).unwrap(), session(true));
+    }
+    #[test]
+    fn interrupted_freeze_recovers_original_directory_permissions() {
+        let fixture = Fixture::new(false);
+        let stage = tempfile::Builder::new()
+            .prefix(".handoff-restore-")
+            .tempdir_in(fixture.state.parent().unwrap())
+            .unwrap();
+        let mut journal = RestoreJournal {
+            state: fixture.state.clone(),
+            staged: stage.path().into(),
+            rollback: fixture
+                .state
+                .parent()
+                .unwrap()
+                .join("handoff-rollback-test"),
+            protocol_modes: BTreeMap::new(),
+        };
+        let path = control_path(&fixture.state, "restore.json").unwrap();
+        freeze_protocol(&fixture.state.join("agents"), &mut journal, &path).unwrap();
+        assert!(!fixture.writer().status.success());
+        recover_restore(&fixture.state).unwrap();
+        assert!(!path.exists());
+        assert!(fixture.writer().status.success());
+    }
 }

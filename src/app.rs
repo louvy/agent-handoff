@@ -1320,11 +1320,23 @@ pub(crate) fn run(mut cli: Cli) -> Result<Value> {
         }
     })();
 
-    drop(write_lock);
     let requested = matches!(
         cli.command,
         Action::Apply { open: true, .. } | Action::Claim { open: true, .. }
     );
+    let identity = if requested && result.is_ok() {
+        Some(
+            db.query_row("SELECT value FROM metadata WHERE key='state_id'", [], |r| {
+                r.get::<_, String>(0)
+            })?,
+        )
+    } else {
+        None
+    };
+    // No SQLite handle may outlive the unlocked launcher operation: restore can
+    // replace the active database while the desktop client is starting.
+    drop(db);
+    drop(write_lock);
     if requested {
         if let Ok(value) = &mut result {
             let plan = if value.get("plan").is_some() {
@@ -1336,13 +1348,74 @@ pub(crate) fn run(mut cli: Cli) -> Result<Value> {
             let target = plan["target_agent"].as_str().context("缺少目标")?;
             let target_id = plan["target_id"].as_str().context("缺少目标 ID")?;
             let cwd = Path::new(plan["workspace"]["cwd"].as_str().context("缺少目录")?);
-            match crate::agent::open(target, target_id, cwd) {
+            let target_id = target_id.to_string();
+            let opened = crate::agent::open(target, &target_id, cwd);
+            let _lock = operation_lock(
+                &state,
+                cli.lock_timeout_seconds,
+                cli.disconnected.as_deref(),
+            )?;
+            crate::maintenance::recover_restore(&state)?;
+            let mut current = Connection::open_with_flags(
+                state.join("handoff.sqlite3"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )?;
+            current.busy_timeout(std::time::Duration::from_secs(10))?;
+            let active_identity: String =
+                current.query_row("SELECT value FROM metadata WHERE key='state_id'", [], |r| {
+                    r.get(0)
+                })?;
+            ensure!(
+                Some(active_identity) == identity,
+                crate::error::fault(
+                    "STATE_CHANGED",
+                    "启动期间状态库身份发生变化",
+                    "核对当前状态和原计划后重试。",
+                    true
+                )
+            );
+            let (active, status) = load_plan(&current, &id)?;
+            ensure!(
+                active.target_id == target_id
+                    && active.target_agent == target
+                    && active.workspace.cwd == cwd,
+                crate::error::fault(
+                    "PLAN_CHANGED",
+                    "启动期间计划身份发生变化",
+                    "核对当前计划及目标会话后重试。",
+                    true
+                )
+            );
+            if let Action::Claim { assignment, .. } = &cli.command {
+                let bound: Option<String> = current
+                    .query_row(
+                        "SELECT plan_id FROM assignments WHERE id=?",
+                        [assignment],
+                        |r| r.get(0),
+                    )
+                    .context("找不到指派")?;
+                ensure!(
+                    bound.as_deref() == Some(id.as_str()),
+                    crate::error::fault(
+                        "PLAN_CHANGED",
+                        "启动期间指派绑定发生变化",
+                        "核对原指派后重试。",
+                        true
+                    )
+                );
+            }
+            match opened {
                 Ok(()) => {
-                    db.execute("UPDATE plans SET status='open_requested' WHERE id=?", [id])?;
-                    plan["status"] = json!("open_requested");
+                    verify_published_target(&cli, &active)?;
+                    let tx = current
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    tx.execute("UPDATE plans SET status='open_requested' WHERE id=?", [&id])?;
+                    tx.commit()?;
+                    *plan = view(&active, "open_requested");
                 }
-                Err(e) => {
-                    let issue = crate::error::response(&e);
+                Err(error) => {
+                    *plan = view(&active, &status);
+                    let issue = crate::error::response(&error);
                     plan["open_error"] = issue["error"].clone();
                     plan["open_issue"] = issue;
                 }

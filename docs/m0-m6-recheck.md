@@ -110,6 +110,40 @@ PYTHONPATH=tests python3 -m unittest -v m9_builtin_history
 
 最终锁定依赖构建、Rust 格式检查和 66 项自动化测试通过。三端组合矩阵完成 64 项检查与观察，其中六个有向组合的拉取和指派共 12 条链路通过。旧计划兼容补充后，12 个恢复专项用例再次通过。只读查询当前使用完整数据库的私有副本以避免源目录写入，大状态库的端到端延迟尚未量测。本轮验证到协议、状态库和原生会话存储，桌面窗口沿用历史验收证据。恢复仍要求原状态路径，升级后应重启各 MCP 服务以统一锁协议。
 
+## main 独立复验（`ce63b5a`）
+
+上轮五项缺口的原复现均通过。协议目标能补回备份中的消息、保留本地合法续写、拒绝分叉，并继续使用原指派和目标 ID。空 agent 目录随备份重建。冲突返回时原状态文件清单及摘要一致，损坏的当前库能在原路径恢复。只读目录与已提交 WAL 可查询，源目录没有新增辅助文件。旧备份执行 GC 后再放回最新库，后建计划仍可用原 ID 执行。
+
+独立持锁进程占用新锁时，CLI 按默认期限在 5.03 秒返回可重试的 `STATE_BUSY`。同一 MCP 服务在指派排队期间约 3 ms 返回版本查询，关闭 stdin 后约 19 ms 退出。释放锁后收件箱仍为空，重发指派并领取成功。
+
+两项交叉场景仍未通过整体验收。
+
+| 优先级 | 复现操作 | 观察结果 |
+| --- | --- | --- |
+| P1 | 在含 240 个额外协议会话的隔离状态中恢复备份。在恢复准备末期，协议 agent 按 v1 约定写同目录临时文件并原子替换目标 JSON，追加一条带唯一标记的消息。 | 客户端替换和 `restore` 都成功。活动目录中没有追加消息，标记只在 `rollback_state` 中。实现先比对活动目录，再同步暂存文件、记录日志、切换目录，期间协议客户端仍可独立写入。见 [恢复时的最后一次比对和切换](../src/maintenance.rs#L652)。 |
+| P2 | 预先交付并备份一个 Claude 计划，让同一计划的 `apply --open` 等待可控启动器。在等待期间成功恢复这份备份，再让启动器正常退出。 | 原命令返回 `open_requested`，对同一计划调用 `status` 却得到 `waiting_for_open`。回读 `rollback_state` 确认状态更新写进了旧库。见 [启动器退出后的状态写入](../src/app.rs#L1341)。 |
+
+格式检查、锁定依赖构建、66 项自动化回归全部通过，其中包含 12 项恢复专项。组合矩阵完成 64 项检查与观察，三端六个方向的拉取和指派共 12 条链路全部通过。本轮覆盖 CLI、stdio MCP、原生会话存储和真实 Git worktree，桌面窗口沿用历史验收。
+
+本机另测同一计划的 CLI `status`，每档运行 5 次。在约 0.1 MiB 和 59.7 MiB 的状态库上，中位耗时分别为 9.8 ms 和 398 ms。这是包含私有数据库副本开销的端到端样本。
+
+## 恢复与客户端并发复验（`fix/handoff-restore-client-races`）
+
+保留上面的 `ce63b5a` 独立验收记录。本分支修复目录切换窗口丢失已发布消息，以及启动器结束后写入旧库的问题。
+
+| 反例或正常对照 | 结果 |
+|---|---|
+| 活动文件的最后一次检查完成后，独立客户端进程用临时文件加原子替换成功追加消息 | 在该确定性窗口暂停恢复并发布消息，恢复返回可重试的 `RESTORE_CHANGED`。活动 JSON 保留消息及原权限，用同一备份重试成功后消息仍在。 |
+| 协议目录已经冻结时尝试发布 | 客户端明确失败，恢复完成后重读原路径并重试成功。不会把失败的文件操作当成发布成功。 |
+| 持有切换前的临时文件句柄，在新目录启用后写入并尝试原子发布 | 新目录未保留过期临时文件，替换明确失败，活动会话完整。重新创建临时文件后可成功发布。回退目录的协议子目录保持只读。 |
+| 冻结期间进程中断 | 从持久化日志恢复原目录权限，客户端随后可以正常发布。 |
+| `apply --open` 或 `claim --open` 等待启动器期间恢复同一计划 | 启动器正常退出，响应和当前库查询均为 `open_requested`，指派响应的嵌套计划状态一致。回退库仍是 `waiting_for_open`。 |
+| 启动期间恢复不包含该计划的旧库 | 返回 `PLAN_NOT_FOUND`，没有报告 `open_requested`，较新计划文件保留，回退库状态也未被更新。 |
+
+切换窗口通过 `src/maintenance.rs` 的 3 项 Rust 测试在精确阶段触发，包含实际独立客户端进程。启动器通过 [m12_restore_open.py](../tests/m12_restore_open.py) 的 3 项公共 CLI 用例由文件同步，覆盖 apply 和 claim。CI 已加入 `cargo test --locked`。
+
+最终锁定依赖构建、格式检查、3 项 Rust 测试及 69 项 Python 回归通过。组合矩阵完成 64 项检查与观察，其中六个有向组合的拉取和指派共 12 条通过。原有锁等待、MCP 断开取消、旧备份 GC 后恢复最新库、慢启动器及 DeepSeek 子进程回收用例继续通过。本轮验证协议、状态库及原生会话存储，桌面窗口沿用历史验收。只读私有快照的完整数据库复制成本仍存在。
+
 ## Reproduce / 本地复现
 
 Start from the repository root on macOS with Git, Rust 1.96+, Python 3 and zstd. The full suite requires Node.js 24.9+ and the tested Harness package on PATH. For example, install the SDK with `npm install --global @deepseek-ai/dsh@0.2.2-rc.1`.
@@ -117,10 +151,11 @@ Start from the repository root on macOS with Git, Rust 1.96+, Python 3 and zstd.
 ```sh
 cargo fmt --check
 cargo build --locked
+cargo test --locked
 python3 -m unittest discover -s tests -p 'm*.py' -v
 python3 tests/acceptance_matrix.py
 ```
 
-The regression suite contains 66 tests. The matrix runs 64 checks and observations, including the 12 cross-client pull and assignment flows. It writes a JSON report to stdout. The held-database-lock case allows 30 seconds for its MCP response, records CLI/MCP elapsed times, and verifies capture succeeds after the lock is released. Other requests retain the default 15-second timeout. The commands use isolated fixture data; no live conversations or credentials are required.
+The regression suite contains 69 Python tests and 3 Rust tests. The matrix runs 64 checks and observations, including the 12 cross-client pull and assignment flows. It writes a JSON report to stdout. The held-database-lock case allows 30 seconds for its MCP response, records CLI/MCP elapsed times, and verifies capture succeeds after the lock is released. Other requests retain the default 15-second timeout. The commands use isolated fixture data; no live conversations or credentials are required.
 
 Use [the backup and recovery tests](../tests/m7_boundaries.py) for the database restore scenarios. To reproduce the manual worktree check, run `python3 scripts/m0_fixture.py` to generate a disposable repository and native-test inputs under the ignored `.m0` directory. After continuing a task in the real target client, use `python3 scripts/m0_verify.py --help` to check an exported native transcript against that fixture.

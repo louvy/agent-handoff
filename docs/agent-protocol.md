@@ -67,4 +67,10 @@ tmp.replace(directory / "issue-42.json")
 - **继续转交**。保留目标 ID，追加新消息并原子替换同一会话文件。具有 `source` 能力的接收端可直接成为下一跳的来源。中转站保留任务和父计划关联。
 - **失败与恢复**。调用方读取 `code`、`retryable`、`next_action`。不支持版本返回 `PROTOCOL_UNSUPPORTED`，未知标识返回 `AGENT_UNKNOWN`，方向不匹配返回 `CAPABILITY_UNSUPPORTED`。损坏的候选出现在 `find_sessions.warnings`。恢复目录权限或文件后可用原指派重试；重复领取复用同一目标。通用协议的 CLI `--open` 返回 `open_issue.code = MANUAL_OPEN_REQUIRED` 和已交付的目标路径。
 
-独立客户端的可执行互操作测试位于 [tests/m8_protocol.py](../tests/m8_protocol.py)。
+## 恢复期间的原子发布
+
+恢复在目录切换阶段临时撤掉协议目录的写权限，并在冻结后再次核对活动文件。无法实际禁止原子发布时，恢复返回 `RESTORE_CONFLICT`。客户端已成功发布新消息时，中转站返回可重试的 `RESTORE_CHANGED`，保留活动会话供原备份重试。
+
+冻结期间，客户端的临时文件创建或原子替换可能遇到暂时的访问拒绝或路径不可用。客户端应保留待发送消息，重新解析注册时返回的绝对目录，读取当前会话后再追加和重试。只有原子替换成功才报告发布成功。恢复目录中的未完成临时文件不会转移成活动会话，保留在 `rollback_state` 中，避免旧文件句柄在切换后发布过期的副本。原回退目录的协议子目录保持只读，阻止已缓存旧目录句柄的客户端继续向退役存储报告写入成功。
+
+独立客户端的可执行互操作测试位于 [tests/m8_protocol.py](../tests/m8_protocol.py)。切换窗口的确定性并发测试位于 `src/maintenance.rs` 的 Rust 测试模块。
