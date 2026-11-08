@@ -277,13 +277,24 @@ pub(crate) fn read_prepared(
     cli: &Cli,
     target_agent: &str,
     target_id: &str,
-    prepared: &Path,
+    target: &Path,
+    bytes: &[u8],
 ) -> Result<txcript::Transcript<txcript::Common>> {
     if target_agent == "deepseek" {
-        let staging = prepared.parent().context("缺少计划目录")?.join("staging");
-        ensure!(staging.is_dir(), "缺少计划准备目录");
+        // The SDK locates v4 files by project/session/generation. Read the
+        // authenticated plan bytes in an isolated store, independent of staging.
+        let root = target
+            .ancestors()
+            .nth(3)
+            .ok_or_else(crate::error::plan_corrupt)?;
+        let store = tempfile::Builder::new()
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir()?;
+        let file = store.path().join(target.strip_prefix(root)?);
+        std::fs::create_dir_all(file.parent().ok_or_else(crate::error::plan_corrupt)?)?;
+        std::fs::write(file, bytes)?;
         let mut config = cli.clone();
-        config.dsh_root = Some(staging);
+        config.dsh_root = Some(store.path().to_owned());
         return deepseek(&config)?.read(target_id);
     }
     let source_agent = if target_agent == "claude-desktop" {
@@ -291,8 +302,7 @@ pub(crate) fn read_prepared(
     } else {
         target_agent
     };
-    let bytes = std::fs::read(prepared)?;
-    load_common(cli, source_agent, target_id, &bytes)
+    load_common(cli, source_agent, target_id, bytes).map_err(|_| crate::error::plan_corrupt())
 }
 pub(crate) fn open(agent: &str, id: &str, cwd: &Path) -> Result<()> {
     if !builtin_target(agent) {

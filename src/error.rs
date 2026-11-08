@@ -220,6 +220,12 @@ pub(crate) fn response(error: &anyhow::Error) -> Value {
     response(&fault(code, text, action, retry))
 }
 
+pub(crate) fn is_target_invalid(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<Fault>()
+        .is_some_and(|fault| fault.code == "TARGET_INVALID")
+}
+
 pub(crate) fn target_invalid() -> anyhow::Error {
     fault(
         "TARGET_INVALID",
@@ -233,7 +239,7 @@ pub(crate) fn plan_corrupt() -> anyhow::Error {
     fault(
         "PLAN_CORRUPT",
         "计划产物已变化",
-        "保留现有目标，从已保存版本重新生成计划。",
+        "从备份恢复原计划产物后，用同一 ID 重试；也可从已保存版本重新生成计划。",
         false,
     )
 }
