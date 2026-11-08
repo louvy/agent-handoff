@@ -1,4 +1,5 @@
 """验证原生目标身份、发现阶段警告、事务回滚与进程中断恢复。"""
+import concurrent.futures
 import json
 import os
 from pathlib import Path
@@ -288,17 +289,166 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(claimed['status'], 'waiting_for_open')
         self.assertEqual(self.orphans(), [])
 
+    def test_waiting_launcher_does_not_block_other_assignments(self):
+        plan = self.f.preview()
+        assignment = self.assignment('codex')
+        marker = self.f.root / 'launcher-started'
+        launcher = self.f.root / 'launcher'
+        launcher.write_text("#!/usr/bin/env python3\nimport pathlib,time\n"
+            f"pathlib.Path({str(marker)!r}).touch()\ntime.sleep(60)\n")
+        launcher.chmod(0o700)
+        env = {**os.environ, 'HOME': str(self.f.root), 'HANDOFF_CLAUDE_BIN': str(launcher)}
+        base = [m1_cli.BIN, '--state-dir', self.f.root / 'state',
+                '--codex-root', self.f.source_root, '--claude-root', self.f.root / 'claude']
+        opening = subprocess.Popen([*base, 'apply', plan['id'], '--open'], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        claim = None
+        try:
+            deadline = time.monotonic() + 5
+            while not marker.exists() and time.monotonic() < deadline and opening.poll() is None:
+                time.sleep(0.02)
+            self.assertTrue(marker.exists())
+            self.assertEqual(self.f.cli('status', plan['id'])['status'], 'waiting_for_open')
+            claim = subprocess.Popen([*base, 'claim', assignment['id'], '--recipient', 'codex'],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = claim.communicate(timeout=3)
+            self.assertEqual(claim.returncode, 0, stderr.decode())
+            self.assertEqual(json.loads(stdout)['status'], 'waiting_for_open')
+            retry = self.server.call('claim_assignment',
+                {'assignment_id': assignment['id'], 'recipient': 'codex'})
+            self.assertEqual(retry['plan']['target_id'], json.loads(stdout)['plan']['target_id'])
+            self.assertIsNone(opening.poll())
+        finally:
+            if opening.poll() is None:
+                os.killpg(opening.pid, signal.SIGKILL)
+            opening.communicate(timeout=5)
+            if claim is not None:
+                if claim.poll() is None:
+                    claim.kill()
+                claim.communicate(timeout=5)
+
+    def assert_process_gone(self, pid):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.02)
+        self.fail(f'Adapter process {pid} remains alive')
+
+    def test_adapter_is_reaped_when_hub_exits(self):
+        package = Path(shutil.which('dsh')).resolve().parent.parent
+        fake_bin = self.f.root / 'cancel-bin'
+        fake_bin.mkdir()
+        marker = self.f.root / 'cancel-sdk-pid'
+        helper_marker = self.f.root / 'cancel-helper-pid'
+        node = fake_bin / 'node'
+        node.write_text("#!/usr/bin/env python3\nimport os,pathlib,subprocess,sys,time\n"
+            "helper = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            f"pathlib.Path({str(helper_marker)!r}).write_text(str(helper.pid))\n"
+            f"pathlib.Path({str(marker)!r}).write_text(str(os.getpid()))\ntime.sleep(60)\n")
+        node.chmod(0o700)
+        env = {**os.environ, 'HOME': str(self.f.root),
+               'PATH': str(fake_bin) + os.pathsep + os.environ['PATH']}
+        # SIGKILL cannot be handled by the hub; neither cancellation mode may
+        # leave a detached SDK running after the operation lock is released.
+        for death_signal in (signal.SIGTERM, signal.SIGKILL):
+            with self.subTest(signal=death_signal):
+                marker.unlink(missing_ok=True)
+                assignment = self.assignment('deepseek')
+                process = subprocess.Popen([m1_cli.BIN, '--state-dir', self.f.root / 'state',
+                    '--dsh-package', package, '--adapter-timeout-seconds', '1',
+                    'claim', assignment['id'], '--recipient', 'deepseek'], env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+                sdk = None
+                try:
+                    deadline = time.monotonic() + 5
+                    while not marker.exists() and time.monotonic() < deadline and process.poll() is None:
+                        time.sleep(0.02)
+                    self.assertTrue(marker.exists())
+                    sdk = int(marker.read_text())
+                    os.killpg(process.pid, death_signal)
+                    process.communicate(timeout=3)
+                    self.assert_process_gone(sdk)
+                    self.assert_process_gone(int(helper_marker.read_text()))
+                    self.assertEqual(self.f.cli('inbox', '--recipient', 'deepseek')['assignments'][0]['status'], 'pending')
+                    self.assertEqual(self.orphans(), [])
+                    delivered = self.f.cli('claim', assignment['id'], '--recipient', 'deepseek')
+                    retry = self.f.cli('claim', assignment['id'], '--recipient', 'deepseek')
+                    self.assertEqual(delivered['plan']['target_id'], retry['plan']['target_id'])
+                finally:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.communicate(timeout=3)
+                    if sdk is not None:
+                        try:
+                            os.killpg(sdk, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
+    def test_adapter_timeout_reaps_child_and_assignment_can_retry(self):
+        # A large request and an SDK that never reads stdin exercise pipe backpressure.
+        self.f.source.write_text(self.f.source.read_text().replace('history-only-97c3', 'x' * 200000))
+        a = self.assignment('deepseek')
+        package = Path(shutil.which('dsh')).resolve().parent.parent
+        fake_bin = self.f.root / 'timeout-bin'
+        fake_bin.mkdir()
+        marker = self.f.root / 'adapter-pid'
+        helper_marker = self.f.root / 'timeout-helper-pid'
+        node = fake_bin / 'node'
+        node.write_text("#!/usr/bin/env python3\nimport os,pathlib,subprocess,sys,time\n"
+                        "helper = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                        f"pathlib.Path({str(helper_marker)!r}).write_text(str(helper.pid))\n"
+                        f"pathlib.Path({str(marker)!r}).write_text(str(os.getpid()))\n"
+                        "sys.stderr.write('diagnostic' * 20000)\nsys.stderr.flush()\ntime.sleep(60)\n")
+        node.chmod(0o700)
+        env = {**os.environ, 'HOME': str(self.f.root),
+               'PATH': str(fake_bin) + os.pathsep + os.environ['PATH']}
+        result = subprocess.run([m1_cli.BIN, '--state-dir', self.f.root / 'state',
+            '--dsh-package', package, '--adapter-timeout-seconds', '1',
+            'claim', a['id'], '--recipient', 'deepseek'], env=env,
+            capture_output=True, text=True, timeout=6)
+        self.assertNotEqual(result.returncode, 0)
+        issue = json.loads(result.stderr)
+        self.assertEqual(issue['code'], 'ADAPTER_TIMEOUT')
+        self.assertTrue(issue['retryable'])
+        self.assertTrue(marker.exists())
+        self.assert_process_gone(int(marker.read_text()))
+        self.assert_process_gone(int(helper_marker.read_text()))
+        self.assertEqual(self.orphans(), [])
+        self.assertEqual(self.f.cli('inbox', '--recipient', 'deepseek')['assignments'][0]['status'], 'pending')
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            claims = list(pool.map(lambda _: self.f.cli('claim', a['id'], '--recipient', 'deepseek'), range(2)))
+        self.assertEqual(claims[0]['plan']['target_id'], claims[1]['plan']['target_id'])
+        self.assertEqual(claims[0]['status'], 'waiting_for_open')
+        self.assertTrue(Path(claims[0]['plan']['target_path']).is_file())
+        with sqlite3.connect(self.f.root / 'state/handoff.sqlite3') as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM plans').fetchone()[0], 1)
+        # A stalled validation of an already delivered target must also time out
+        # without replacing the native session or losing its plan identity.
+        plan = claims[0]['plan']
+        original = Path(plan['target_path']).read_bytes()
+        result = subprocess.run([m1_cli.BIN, '--state-dir', self.f.root / 'state',
+            '--dsh-package', package, '--adapter-timeout-seconds', '1',
+            'apply', plan['id']], env=env, capture_output=True, text=True, timeout=6)
+        self.assertEqual(json.loads(result.stderr)['code'], 'ADAPTER_TIMEOUT')
+        self.assertEqual(Path(plan['target_path']).read_bytes(), original)
+        self.assertEqual(self.f.cli('apply', plan['id'])['target_id'], plan['target_id'])
+
     def test_killed_preparation_is_reclaimed_on_restart(self):
         a = self.assignment('deepseek')
+        published = self.f.preview()
+        self.f.cli('apply', published['id'])
         package = Path(shutil.which('dsh')).resolve().parent.parent
         fake_bin = self.f.root / 'fake-bin'
         fake_bin.mkdir()
         node = fake_bin / 'node'
         marker = self.f.root / 'sdk-entered'
         # Read the real bridge request and pause after the transcript has been written.
-        node.write_text("#!/usr/bin/env python3\nimport sys,json,pathlib,time\n"
+        node.write_text("#!/usr/bin/env python3\nimport os,sys,json,pathlib,time\n"
                         "json.load(sys.stdin)\n"
-                        f"pathlib.Path({str(marker)!r}).write_text('ready')\n"
+                        f"pathlib.Path({str(marker)!r}).write_text(str(os.getpid()))\n"
                         "time.sleep(60)\n")
         node.chmod(0o700)
         args = [m1_cli.BIN, '--state-dir', self.f.root / 'state',
@@ -318,12 +468,23 @@ class BoundaryTests(unittest.TestCase):
             observer = subprocess.Popen([m1_cli.BIN, '--state-dir', self.f.root / 'state', 'versions'],
                 env={**os.environ, 'HOME': str(self.f.root)}, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             time.sleep(0.15)
-            self.assertIsNone(observer.poll(), 'recovery must wait for active preparation')
+            stdout, stderr = observer.communicate(timeout=3)
+            self.assertEqual(observer.returncode, 0, stderr.decode())
+            self.assertIn('versions', json.loads(stdout))
+            self.assertEqual(self.server.call('list_assignments', {'recipient': 'deepseek'})['assignments'][0]['status'], 'pending')
+            self.assertEqual(self.f.cli('status', published['id'])['status'], 'waiting_for_open')
+            self.assertEqual(self.server.call('get_handoff', {'handoff_id': published['id']})['status'], 'waiting_for_open')
             self.assertEqual(len(self.orphans()), 1)
         finally:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
             process.communicate(timeout=5)
+            # The adapter has its own process group, separate from the killed hub.
+            if marker.exists():
+                try:
+                    os.killpg(int(marker.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             if observer is not None:
                 try:
                     stdout, stderr = observer.communicate(timeout=5)
@@ -333,7 +494,7 @@ class BoundaryTests(unittest.TestCase):
                     if observer.poll() is None:
                         observer.kill()
                         observer.communicate(timeout=5)
-        # The next ordinary API operation performs recovery after acquiring the writer lock.
+        # Once the operation lock is released, the next API call reclaims preparation.
         inbox = self.server.call('list_assignments', {'recipient': 'deepseek'})['assignments']
         self.assertEqual(inbox[0]['status'], 'pending')
         self.assertEqual(self.orphans(), [])

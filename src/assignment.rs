@@ -79,10 +79,9 @@ pub(crate) fn claim(
     open: bool,
 ) -> Result<Value> {
     crate::agent::check_target(cli, recipient)?;
-    // Plan creation and assignment ownership commit together. A retry after a
-    // crash resumes the committed plan, including a failed or unfinished publish.
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let (body, plan_id): (String, Option<String>) = tx
+    // Serialize preparation without holding a SQLite writer during adapter I/O.
+    let lock = app::operation_lock(state)?;
+    let (body, plan_id): (String, Option<String>) = db
         .query_row(
             "SELECT body,plan_id FROM assignments WHERE id=?",
             [id],
@@ -97,7 +96,7 @@ pub(crate) fn claim(
         None => {
             let (plan, guard) = app::prepare_version(
                 cli,
-                &tx,
+                db,
                 state,
                 &item.version_id,
                 recipient,
@@ -106,20 +105,23 @@ pub(crate) fn claim(
             )?;
             preparation = Some(guard);
             let id = plan["id"].as_str().context("计划缺少 ID")?.to_string();
-            tx.execute(
-                "UPDATE assignments SET plan_id=? WHERE id=?",
-                params![id, item.id],
-            )?;
             id
         }
     };
     if let Some(guard) = &mut preparation {
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        guard.insert(&tx)?;
+        tx.execute(
+            "UPDATE assignments SET plan_id=? WHERE id=?",
+            params![plan_id, item.id],
+        )?;
         guard.preserve();
+        tx.commit()?;
     }
-    tx.commit()?;
     if let Some(guard) = &mut preparation {
         guard.finish();
     }
+    drop(lock);
     let plan = app::apply(cli, db, &plan_id, open)?;
     let mut result = view(db, &item, Some(&plan_id))?;
     result["plan"] = plan;

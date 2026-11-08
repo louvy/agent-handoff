@@ -21,16 +21,19 @@ fn claude(cli: &Cli) -> Result<ClaudeStore> {
     })
 }
 fn deepseek(cli: &Cli) -> Result<crate::deepseek::DeepSeek> {
-    crate::deepseek::DeepSeek::new(cli.dsh_root.as_deref(), cli.dsh_package.as_deref()).map_err(
-        |_| {
-            crate::error::fault(
-                "ADAPTER_UNAVAILABLE",
-                "DeepSeek SDK 不可用",
-                "安装兼容的 Harness，或用 --dsh-package 指向有效包目录后重试。",
-                true,
-            )
-        },
+    crate::deepseek::DeepSeek::new(
+        cli.dsh_root.as_deref(),
+        cli.dsh_package.as_deref(),
+        cli.adapter_timeout_seconds,
     )
+    .map_err(|_| {
+        crate::error::fault(
+            "ADAPTER_UNAVAILABLE",
+            "DeepSeek SDK 不可用",
+            "安装兼容的 Harness，或用 --dsh-package 指向有效包目录后重试。",
+            true,
+        )
+    })
 }
 pub(crate) fn discover(
     cli: &Cli,

@@ -33,11 +33,23 @@ pub(crate) struct Cli {
     pub(crate) dsh_root: Option<PathBuf>,
     #[arg(long, global = true)]
     pub(crate) dsh_package: Option<PathBuf>,
+    /// Maximum duration of each DeepSeek SDK operation.
+    #[arg(long, global = true, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) adapter_timeout_seconds: u64,
     #[command(subcommand)]
     pub(crate) command: Action,
 }
 #[derive(Subcommand, Clone)]
 pub(crate) enum Action {
+    #[command(name = "__adapter-supervisor", hide = true)]
+    AdapterSupervisor {
+        #[arg(long)]
+        package: PathBuf,
+        #[arg(long)]
+        owner_pid: u32,
+        #[arg(long)]
+        timeout_seconds: u64,
+    },
     Mcp,
     /// Discover built-in and registered local agents.
     Agents,
@@ -463,9 +475,11 @@ fn create_plan(
 ) -> Result<Value> {
     crate::agent::check_target(cli, target_agent)?;
     let version = capture(cli, db, source, source_agent)?;
-    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let _lock = operation_lock(state)?;
     let (plan, mut preparation) =
-        prepare_version(cli, &tx, state, &version.id, target_agent, true, None)?;
+        prepare_version(cli, db, state, &version.id, target_agent, true, None)?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    preparation.insert(&tx)?;
     preparation.preserve();
     tx.commit()?;
     preparation.finish();
@@ -474,8 +488,17 @@ fn create_plan(
 pub(crate) struct Preparation {
     path: PathBuf,
     preserve_directory: bool,
+    plan: Option<Plan>,
 }
 impl Preparation {
+    pub(crate) fn insert(&self, db: &Connection) -> Result<()> {
+        let plan = self.plan.as_ref().context("准备产物缺少计划")?;
+        db.execute(
+            "INSERT INTO plans(id,body,status) VALUES(?,?,'previewed')",
+            params![plan.id, serde_json::to_string(plan)?],
+        )?;
+        Ok(())
+    }
     pub(crate) fn preserve(&mut self) {
         self.preserve_directory = true;
     }
@@ -509,9 +532,10 @@ pub(crate) fn prepare_version(
     let target_id = uuid::Uuid::new_v4().to_string();
     let folder = state.join(&id);
     private_dir(&folder)?;
-    let cleanup = Preparation {
+    let mut cleanup = Preparation {
         path: folder.clone(),
         preserve_directory: false,
+        plan: None,
     };
     let identity: String =
         db.query_row("SELECT value FROM metadata WHERE key='state_id'", [], |r| {
@@ -595,15 +619,13 @@ pub(crate) fn prepare_version(
     write_new(&folder.join(".handoff-commit-intent"), identity.as_bytes())?;
     fs::File::open(&folder)?.sync_all()?;
     fs::File::open(state)?.sync_all()?;
-    db.execute(
-        "INSERT INTO plans(id,body,status) VALUES(?,?,'previewed')",
-        params![id, serde_json::to_string(&plan)?],
-    )?;
-    Ok((view(&plan, "previewed"), cleanup))
+    let result = view(&plan, "previewed");
+    cleanup.plan = Some(plan);
+    Ok((result, cleanup))
 }
 pub(crate) fn apply(cli: &Cli, db: &mut Connection, id: &str, open: bool) -> Result<Value> {
-    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let (plan, status) = load_plan(&tx, id)?;
+    let lock = operation_lock(cli.state_dir.as_deref().context("缺少状态目录")?)?;
+    let (plan, status) = load_plan(db, id)?;
     if !crate::agent::builtin_target(&plan.target_agent) {
         ensure!(
             crate::protocol::target(cli, &plan.target_agent, &plan.target_id)? == plan.target,
@@ -640,6 +662,7 @@ pub(crate) fn apply(cli: &Cli, db: &mut Connection, id: &str, open: bool) -> Res
             &plan.workspace.cwd,
         )?;
     }
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     if status == "previewed" {
         if plan.verify_source {
             ensure!(
@@ -687,6 +710,7 @@ pub(crate) fn apply(cli: &Cli, db: &mut Connection, id: &str, open: bool) -> Res
         )?;
     }
     tx.commit()?;
+    drop(lock);
     let mut result = view(
         &plan,
         if status == "previewed" {
@@ -710,8 +734,31 @@ pub(crate) fn apply(cli: &Cli, db: &mut Connection, id: &str, open: bool) -> Res
     }
     Ok(result)
 }
+fn lock_file(state: &Path) -> Result<fs::File> {
+    Ok(fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(state.join(".handoff-operation.lock"))?)
+}
+
+// OS-owned locks are released on process exit, including abrupt termination.
+// Always take this lock before starting a SQLite write transaction.
+pub(crate) fn operation_lock(state: &Path) -> Result<fs::File> {
+    let file = lock_file(state)?;
+    file.lock()?;
+    Ok(file)
+}
+
 fn cleanup_orphans(db: &mut Connection, state: &Path) -> Result<()> {
-    // All preparation writers hold this same SQLite write lock until binding commits.
+    let lock = lock_file(state)?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for entry in fs::read_dir(state)? {
         let entry = entry?;
@@ -810,7 +857,9 @@ pub(crate) fn run(mut cli: Cli) -> Result<Value> {
             role,
             protocol_version,
         } => crate::protocol::register(&cli, &mut db, id, role, *protocol_version),
-        Action::Mcp => anyhow::bail!("MCP 入口应由服务端启动"),
+        Action::Mcp | Action::AdapterSupervisor { .. } => {
+            anyhow::bail!("内部入口不能作为业务操作执行")
+        }
         Action::Sessions {
             project,
             query,
@@ -889,9 +938,11 @@ pub(crate) fn run(mut cli: Cli) -> Result<Value> {
             Ok(version_view(&capture(&cli, &mut db, source, from)?))
         }
         Action::Prepare { version, to } => {
-            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let _lock = operation_lock(&state)?;
             let (plan, mut preparation) =
-                prepare_version(&cli, &tx, &state, version, to, false, None)?;
+                prepare_version(&cli, &db, &state, version, to, false, None)?;
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            preparation.insert(&tx)?;
             preparation.preserve();
             tx.commit()?;
             preparation.finish();

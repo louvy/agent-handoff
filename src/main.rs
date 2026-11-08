@@ -27,6 +27,15 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     };
+    if let app::Action::AdapterSupervisor {
+        package,
+        owner_pid,
+        timeout_seconds,
+    } = &cli.command
+    {
+        // Keep supervision independent of application state and SQLite locks.
+        std::process::exit(deepseek::supervise(package, *owner_pid, *timeout_seconds).unwrap_or(1));
+    }
     if matches!(cli.command, app::Action::Mcp) {
         if let Err(error) = mcp::serve(cli).await {
             eprintln!("{}", crate::error::response(&error));
