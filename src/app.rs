@@ -182,6 +182,10 @@ struct Plan {
     prepared: PathBuf,
     prepared_digest: String,
     transcript: PathBuf,
+    #[serde(default)]
+    history: Option<PathBuf>,
+    #[serde(default)]
+    history_digest: Option<String>,
     losses: Vec<String>,
 }
 fn verify_source_default() -> bool {
@@ -327,6 +331,94 @@ fn default_target() -> String {
 }
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    }
+}
+#[derive(Serialize, Deserialize)]
+struct HistoryMessage {
+    role: String,
+    digest: String,
+}
+#[derive(Serialize, Deserialize)]
+struct HistoryManifest {
+    format_version: u32,
+    messages: Vec<HistoryMessage>,
+}
+fn history_bytes(messages: &[Message]) -> Result<Vec<u8>> {
+    let entries: Vec<HistoryMessage> = messages
+        .iter()
+        .map(|message| {
+            Ok(HistoryMessage {
+                role: role_name(message.role).into(),
+                digest: digest(&serde_json::to_vec(&message.content)?),
+            })
+        })
+        .collect::<Result<_>>()?;
+    Ok(serde_json::to_vec(&HistoryManifest {
+        format_version: 1,
+        messages: entries,
+    })?)
+}
+// Compare only the delivered conversation, not target-owned metadata: clients
+// may rewrite titles, models, timestamps, usage, and JSON formatting, but the
+// messages already handed off must remain an unchanged prefix.
+fn verify_history(plan: &Plan, messages: &[Message]) -> Result<()> {
+    let (Some(path), Some(expected_digest)) = (&plan.history, &plan.history_digest) else {
+        if plan.history.is_none() && plan.history_digest.is_none() {
+            // Plans written before the manifest existed cannot verify this.
+            return Ok(());
+        }
+        return Err(crate::error::plan_corrupt());
+    };
+    let bytes = fs::read(path).map_err(|_| crate::error::plan_corrupt())?;
+    ensure!(
+        digest(&bytes) == *expected_digest,
+        crate::error::plan_corrupt()
+    );
+    let manifest: HistoryManifest =
+        serde_json::from_slice(&bytes).map_err(|_| crate::error::plan_corrupt())?;
+    ensure!(manifest.format_version == 1, crate::error::plan_corrupt());
+    ensure!(
+        messages.len() >= manifest.messages.len(),
+        crate::error::target_invalid()
+    );
+    for (message, delivered) in messages.iter().zip(&manifest.messages) {
+        let role = role_name(message.role);
+        ensure!(
+            role == delivered.role
+                && digest(&serde_json::to_vec(&message.content)?) == delivered.digest,
+            crate::error::target_invalid()
+        );
+    }
+    Ok(())
+}
+// Baseline for plans that predate the manifest: decode the native artifact
+// kept beside the plan. Missing or unreadable artifacts skip the check rather
+// than make an older delivered plan permanently unusable.
+fn legacy_delivered(cli: &Cli, plan: &Plan) -> Option<Transcript> {
+    let delivered =
+        crate::agent::read_prepared(cli, &plan.target_agent, &plan.target_id, &plan.prepared)
+            .ok()?;
+    Some(delivered)
+}
+fn verify_delivered(delivered: &[Message], messages: &[Message]) -> Result<()> {
+    ensure!(
+        messages.len() >= delivered.len(),
+        crate::error::target_invalid()
+    );
+    for (delivered, message) in delivered.iter().zip(messages) {
+        ensure!(
+            role_name(message.role) == role_name(delivered.role)
+                && digest(&serde_json::to_vec(&message.content)?)
+                    == digest(&serde_json::to_vec(&delivered.content)?),
+            crate::error::target_invalid()
+        );
+    }
+    Ok(())
 }
 fn home() -> Result<PathBuf> {
     Ok(std::env::var_os("HOME").context("HOME 未设置")?.into())
@@ -585,10 +677,17 @@ pub(crate) fn prepare_version(
     }
     common.body.retain(|message| !message.content.is_empty());
     let staging = folder.join("staging");
-    let (bytes, target) =
+    let (bytes, target, delivered) =
         crate::agent::prepare(cli, target_agent, &mut common, &staging, &id, &target_id)?;
     let prepared = folder.join("native.jsonl");
     write_new(&prepared, &bytes)?;
+    let (history, history_digest) = if crate::agent::builtin_target(target_agent) {
+        let bytes = history_bytes(&delivered.body)?;
+        write_new(&folder.join("history.json"), &bytes)?;
+        (Some(folder.join("history.json")), Some(digest(&bytes)))
+    } else {
+        (None, None)
+    };
     let plan = Plan {
         id: id.clone(),
         task_id: version.task_id,
@@ -607,6 +706,8 @@ pub(crate) fn prepare_version(
         prepared,
         prepared_digest: digest(&bytes),
         transcript: folder.join("transcript.txt"),
+        history,
+        history_digest,
         losses,
     };
     // Persist the commit boundary before inserting into SQLite. Absence from an
@@ -649,16 +750,25 @@ pub(crate) fn apply(cli: &Cli, db: &mut Connection, id: &str, open: bool) -> Res
         );
     }
     if status != "previewed" {
-        crate::agent::validate_target(
+        let target = crate::agent::validate_target(
             cli,
             &plan.target_agent,
             &plan.target_id,
             &plan.target,
             &plan.workspace.cwd,
         )?;
-        if !crate::agent::builtin_target(&plan.target_agent) {
+        if crate::agent::builtin_target(&plan.target_agent) {
+            if plan.history.is_some() {
+                verify_history(&plan, &target.body)?;
+            } else if let Some(delivered) = legacy_delivered(cli, &plan) {
+                verify_delivered(&delivered.body, &target.body)?;
+            }
+        } else {
             let prepared = fs::read(&plan.prepared)?;
-            ensure!(digest(&prepared) == plan.prepared_digest, "计划产物已变化");
+            ensure!(
+                digest(&prepared) == plan.prepared_digest,
+                crate::error::plan_corrupt()
+            );
             ensure!(
                 crate::protocol::continued(&plan.target_id, &prepared, &fs::read(&plan.target)?),
                 crate::error::target_invalid()
@@ -685,7 +795,10 @@ pub(crate) fn apply(cli: &Cli, db: &mut Connection, id: &str, open: bool) -> Res
             );
         }
         let bytes = fs::read(&plan.prepared)?;
-        ensure!(digest(&bytes) == plan.prepared_digest, "计划产物已变化");
+        ensure!(
+            digest(&bytes) == plan.prepared_digest,
+            crate::error::plan_corrupt()
+        );
         private_dir(plan.target.parent().context("无目标父目录")?)?;
         if plan.target.exists() {
             let current = fs::read(&plan.target)?;

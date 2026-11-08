@@ -109,7 +109,7 @@ pub(crate) fn validate_target(
     id: &str,
     path: &Path,
     cwd: &Path,
-) -> Result<()> {
+) -> Result<txcript::Transcript<txcript::Common>> {
     // Access and adapter errors retain their retry instructions.
     let bytes = std::fs::read(path)?;
     ensure!(!bytes.is_empty(), crate::error::target_invalid());
@@ -117,7 +117,16 @@ pub(crate) fn validate_target(
         let mut config = cli.clone();
         // Harness v4 stores root/project/session-id/session.v4.jsonl.zstd.
         config.dsh_root = path.ancestors().nth(3).map(Path::to_path_buf);
-        return deepseek(&config)?.validate(id, cwd, path);
+        let adapter = deepseek(&config)?;
+        adapter.validate(id, cwd, path)?;
+        let common = adapter.read(id)?;
+        ensure!(
+            common.meta.id == id
+                && common.meta.cwd.as_deref() == cwd.to_str()
+                && !common.body.is_empty(),
+            crate::error::target_invalid()
+        );
+        return Ok(common);
     }
     let source_agent = if agent == "claude-desktop" {
         "claude"
@@ -132,7 +141,7 @@ pub(crate) fn validate_target(
             && !common.body.is_empty(),
         crate::error::target_invalid()
     );
-    Ok(())
+    Ok(common)
 }
 
 fn codex(cli: &Cli) -> Result<CodexStore> {
@@ -208,13 +217,15 @@ pub(crate) fn prepare(
     staging: &Path,
     id: &str,
     target_id: &str,
-) -> Result<(Vec<u8>, PathBuf)> {
+) -> Result<(Vec<u8>, PathBuf, txcript::Transcript<txcript::Common>)> {
     if !builtin_target(target_agent) {
         let path = crate::protocol::target(cli, target_agent, target_id)?;
-        return Ok((crate::protocol::encode(common)?, path));
+        let bytes = crate::protocol::encode(common)?;
+        let delivered = crate::protocol::decode(target_id, &bytes)?;
+        return Ok((bytes, path, delivered));
     }
-    let result = match target_agent {
-        "deepseek" => deepseek(cli)?.prepare(&common, staging)?,
+    let (bytes, target) = match target_agent {
+        "deepseek" => return deepseek(cli)?.prepare(&common, staging),
         "codex" => {
             // Target configuration chooses the runtime model on resume.
             common.meta.model = None;
@@ -249,7 +260,39 @@ pub(crate) fn prepare(
             )
         }
     };
-    Ok(result)
+    // The delivered manifest describes what the target stores, not the
+    // pre-conversion transcript: codecs may normalize tool payloads.
+    let delivered_agent = if target_agent == "claude-desktop" {
+        "claude"
+    } else {
+        target_agent
+    };
+    let delivered = load_common(cli, delivered_agent, target_id, &bytes)?;
+    Ok((bytes, target, delivered))
+}
+
+// Plans written before the delivered manifest existed can still be checked
+// against the native artifact kept in their plan directory.
+pub(crate) fn read_prepared(
+    cli: &Cli,
+    target_agent: &str,
+    target_id: &str,
+    prepared: &Path,
+) -> Result<txcript::Transcript<txcript::Common>> {
+    if target_agent == "deepseek" {
+        let staging = prepared.parent().context("缺少计划目录")?.join("staging");
+        ensure!(staging.is_dir(), "缺少计划准备目录");
+        let mut config = cli.clone();
+        config.dsh_root = Some(staging);
+        return deepseek(&config)?.read(target_id);
+    }
+    let source_agent = if target_agent == "claude-desktop" {
+        "claude"
+    } else {
+        target_agent
+    };
+    let bytes = std::fs::read(prepared)?;
+    load_common(cli, source_agent, target_id, &bytes)
 }
 pub(crate) fn open(agent: &str, id: &str, cwd: &Path) -> Result<()> {
     if !builtin_target(agent) {

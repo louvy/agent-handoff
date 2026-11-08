@@ -228,3 +228,12 @@ pub(crate) fn target_invalid() -> anyhow::Error {
         false,
     )
 }
+
+pub(crate) fn plan_corrupt() -> anyhow::Error {
+    fault(
+        "PLAN_CORRUPT",
+        "计划产物已变化",
+        "保留现有目标，从已保存版本重新生成计划。",
+        false,
+    )
+}

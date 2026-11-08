@@ -242,6 +242,68 @@ class BoundaryTests(unittest.TestCase):
                 reread = self.f.cli('capture', claim['plan']['target_id'], '--from', source_agent)
                 self.assertEqual(reread['source_id'], claim['plan']['target_id'])
 
+    def test_builtin_delivered_history_must_survive_retry(self):
+        for agent in ('codex', 'claude-desktop'):
+            with self.subTest(agent=agent):
+                plan = self.f.cli('preview', 'source-id', '--to', agent)
+                self.f.cli('apply', plan['id'])
+                target = Path(plan['target_path'])
+                original = target.read_bytes()
+                lines = original.decode().splitlines()
+                self.assertGreater(len(lines), 2)
+                # The surviving records still carry the target ID and cwd.
+                target.write_text('\n'.join(lines[:2]) + '\n')
+                self.assertEqual(json.loads(self.f.cli('apply', plan['id'], ok=False))['code'],
+                                 'TARGET_INVALID')
+                target.write_bytes(original)
+                rewritten = original.replace(b'history-only-97c3', b'rewritten-history')
+                self.assertNotEqual(rewritten, original)
+                target.write_bytes(rewritten)
+                self.assertEqual(json.loads(self.f.cli('apply', plan['id'], ok=False))['code'],
+                                 'TARGET_INVALID')
+                target.write_bytes(original)
+                self.assertEqual(self.f.cli('apply', plan['id'])['target_id'], plan['target_id'])
+                if agent == 'codex':
+                    with target.open('a') as stream:
+                        stream.write(json.dumps({
+                            'type': 'response_item',
+                            'timestamp': '2026-11-08T10:03:00Z',
+                            'payload': {'type': 'message', 'role': 'user',
+                                        'content': [{'type': 'input_text',
+                                                     'text': 'new codex progress'}]},
+                        }) + '\n')
+                    self.assertEqual(self.f.cli('apply', plan['id'])['target_id'],
+                                     plan['target_id'])
+        with self.subTest(agent='deepseek'):
+            plan = self.f.cli('preview', 'source-id', '--to', 'deepseek')
+            self.f.cli('apply', plan['id'])
+            target = Path(plan['target_path'])
+            original = target.read_bytes()
+            target.write_bytes(original[:len(original) // 2])
+            self.assertEqual(json.loads(self.f.cli('apply', plan['id'], ok=False))['code'],
+                             'TARGET_INVALID')
+            target.write_bytes(original)
+            self.assertEqual(self.f.cli('apply', plan['id'])['target_id'], plan['target_id'])
+
+    def test_legacy_builtin_plan_uses_prepared_artifact(self):
+        plan = self.f.cli('preview', 'source-id', '--to', 'claude-desktop')
+        self.f.cli('apply', plan['id'])
+        target = Path(plan['target_path'])
+        original = target.read_bytes()
+        database = self.f.root / 'state/handoff.sqlite3'
+        with sqlite3.connect(database) as db:
+            body, = db.execute('SELECT body FROM plans WHERE id=?', [plan['id']]).fetchone()
+            value = json.loads(body)
+            value.pop('history', None)
+            value.pop('history_digest', None)
+            db.execute('UPDATE plans SET body=? WHERE id=?', [json.dumps(value), plan['id']])
+        (self.f.root / 'state' / plan['id'] / 'history.json').unlink()
+        target.write_bytes(original.replace(b'history-only-97c3', b'rewritten-history'))
+        self.assertEqual(json.loads(self.f.cli('apply', plan['id'], ok=False))['code'],
+                         'TARGET_INVALID')
+        target.write_bytes(original)
+        self.assertEqual(self.f.cli('apply', plan['id'])['target_id'], plan['target_id'])
+
     def test_invalid_section_has_same_cli_mcp_contract(self):
         version = self.f.cli('capture', 'source-id')
         cli = json.loads(self.f.cli('read', version['id'], '--section', 'invalid', ok=False))
