@@ -273,12 +273,44 @@ impl ServerHandler for HandoffServer {
             )
     }
 }
-pub(crate) async fn serve(config: Cli) -> anyhow::Result<()> {
+// Detect transport EOF before the MCP service drains outstanding handlers.
+struct Input {
+    inner: tokio::io::Stdin,
+    disconnected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl tokio::io::AsyncRead for Input {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let had_capacity = buf.remaining() > 0;
+        let result = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(result, std::task::Poll::Ready(_))
+            && had_capacity
+            && buf.filled().len() == before
+        {
+            self.disconnected
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+}
+pub(crate) async fn serve(mut config: Cli) -> anyhow::Result<()> {
+    let disconnected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    config.disconnected = Some(disconnected.clone());
     HandoffServer {
         config,
         tool_router: HandoffServer::tool_router(),
     }
-    .serve(rmcp::transport::stdio())
+    .serve((
+        Input {
+            inner: tokio::io::stdin(),
+            disconnected,
+        },
+        tokio::io::stdout(),
+    ))
     .await?
     .waiting()
     .await?;

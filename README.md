@@ -113,7 +113,7 @@ handoff gc --older-than 30d
 handoff gc --older-than 30d --execute
 ```
 
-Version and inbox pages return `next_cursor`. Pass it as `--cursor` on the next call (MCP `cursor`). Restore uses the original state directory recorded in the backup and creates a rollback backup. Preserve the original worktree and native client stores separately. GC previews explicitly archived tasks by default. [State lifecycle and recovery](docs/development-plan.md)
+Version and inbox pages return `next_cursor`. Pass it as `--cursor` on the next call (MCP `cursor`). Restore uses the original state directory recorded in the backup, validates a complete replacement tree, and retains the previous tree as `rollback_state`. Protocol sessions keep the longer valid continuation and reject divergent histories. Empty or damaged local sessions can recover from a valid backup. Healthy databases also get a `rollback_backup`. Preserve the original worktree and native client stores separately. GC previews explicitly archived tasks by default. Writer lock waits default to five seconds and can be adjusted with `--lock-timeout-seconds`. Restart MCP servers after upgrading to use the same locking protocol. [State lifecycle and recovery](docs/development-plan.md)
 
 ## CLI and MCP reference
 

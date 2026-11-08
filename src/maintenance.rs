@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -295,23 +295,179 @@ fn validate_backup(path: &Path) -> Result<Manifest> {
     );
     Ok(manifest)
 }
-pub(crate) fn restore(state: &Path, path: &Path) -> Result<Value> {
+pub(crate) fn control_path(state: &Path, suffix: &str) -> Result<PathBuf> {
+    let name = state
+        .file_name()
+        .context("无状态目录名称")?
+        .to_str()
+        .context("状态目录名称无效")?;
+    Ok(state
+        .parent()
+        .context("无状态父目录")?
+        .join(format!(".{name}.handoff-{suffix}")))
+}
+
+fn database_files(database: &Path) -> Result<(Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>)> {
+    let main = fs::read(database)?;
+    let companion = |suffix: &str| -> Result<Option<Vec<u8>>> {
+        match fs::read(database.with_file_name(format!("handoff.sqlite3-{suffix}"))) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    };
+    Ok((main, companion("wal")?, companion("journal")?))
+}
+// Read stable copies, including committed WAL frames, without opening the source
+// in SQLite. SQLite may create auxiliary files only inside the private tempdir.
+pub(crate) fn read_snapshot(database: &Path) -> Result<Connection> {
+    for _ in 0..3 {
+        let before = database_files(database)?;
+        let temp = tempfile::Builder::new().prefix("handoff-read-").tempdir()?;
+        let copy = temp.path().join("handoff.sqlite3");
+        fs::write(&copy, &before.0)?;
+        if let Some(wal) = &before.1 {
+            fs::write(temp.path().join("handoff.sqlite3-wal"), wal)?;
+        }
+        if let Some(journal) = &before.2 {
+            fs::write(temp.path().join("handoff.sqlite3-journal"), journal)?;
+        }
+        if before != database_files(database)? {
+            continue;
+        }
+        let copied = Connection::open(copy)?;
+        let mut memory = Connection::open_in_memory()?;
+        {
+            let backup = rusqlite::backup::Backup::new(&copied, &mut memory)?;
+            backup.run_to_completion(64, Duration::from_millis(1), None)?;
+        }
+        if before == database_files(database)? {
+            return Ok(memory);
+        }
+    }
+    Err(crate::error::fault(
+        "STATE_BUSY",
+        "读取期间状态库持续变化",
+        "稍后重试查询。",
+        true,
+    ))
+}
+
+#[derive(Serialize, Deserialize)]
+struct RestoreJournal {
+    state: PathBuf,
+    staged: PathBuf,
+    rollback: PathBuf,
+}
+fn persist_journal(path: &Path, journal: &RestoreJournal) -> Result<()> {
+    let temp = tempfile::NamedTempFile::new_in(path.parent().context("无日志父目录")?)?;
+    fs::write(temp.path(), serde_json::to_vec(journal)?)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path).map_err(|e| e.error)?;
+    fs::File::open(path.parent().context("无日志父目录")?)?.sync_all()?;
+    Ok(())
+}
+// Caller holds the stable sibling writer lock. Queries never repair state.
+pub(crate) fn recover_restore(state: &Path) -> Result<()> {
+    let path = control_path(state, "restore.json")?;
+    if !path.try_exists()? {
+        return Ok(());
+    }
+    let journal: RestoreJournal = serde_json::from_slice(&fs::read(&path)?)?;
+    let parent = state.parent().context("无状态父目录")?;
+    ensure!(
+        journal.state == state
+            && journal.staged.parent() == Some(parent)
+            && journal.rollback.parent() == Some(parent)
+            && journal
+                .staged
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(".handoff-restore-"))
+            && journal
+                .rollback
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("handoff-rollback-")),
+        fault("STATE_INVALID", "恢复日志路径不属于当前状态目录")
+    );
+    if !state.exists() && journal.rollback.exists() {
+        fs::rename(&journal.rollback, state)?;
+    }
+    if journal.staged.exists() {
+        fs::remove_dir_all(&journal.staged)?;
+    }
+    fs::remove_file(path)?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dest = destination.join(entry.file_name());
+        ensure!(
+            !ty.is_symlink(),
+            fault("RESTORE_CONFLICT", "状态目录包含符号链接")
+        );
+        if ty.is_dir() {
+            crate::app::private_dir(&dest)?;
+            copy_tree(&entry.path(), &dest)?;
+        } else {
+            ensure!(
+                ty.is_file(),
+                fault("RESTORE_CONFLICT", "状态目录包含特殊文件")
+            );
+            fs::copy(entry.path(), dest)?;
+        }
+    }
+    Ok(())
+}
+fn restore_protocol(current: &[u8], saved: &[u8], id: &str) -> Result<Vec<u8>> {
+    let saved_session = match crate::protocol::decode(id, saved) {
+        Ok(value) => value,
+        Err(_) => {
+            return Ok(if crate::protocol::decode(id, current).is_ok() {
+                current.to_vec()
+            } else {
+                saved.to_vec()
+            });
+        }
+    };
+    let current_session = match crate::protocol::decode(id, current) {
+        Ok(value) => value,
+        // The corrupt local copy is preserved in the rollback tree.
+        Err(_) => return Ok(saved.to_vec()),
+    };
+    ensure!(
+        saved_session.meta.cwd == current_session.meta.cwd,
+        fault("RESTORE_CONFLICT", "协议会话工作目录发生分叉")
+    );
+    if saved_session.body.starts_with(&current_session.body) {
+        return Ok(saved.to_vec());
+    }
+    if current_session.body.starts_with(&saved_session.body) {
+        return Ok(current.to_vec());
+    }
+    Err(fault("RESTORE_CONFLICT", "协议会话历史发生分叉"))
+}
+pub(crate) fn restore(
+    state: &Path,
+    path: &Path,
+    seconds: u64,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Value> {
     let source = path.canonicalize()?;
     ensure!(
         !source.starts_with(state),
         fault("BACKUP_CONFLICT", "恢复来源必须位于状态目录外")
     );
-    let _lock = crate::app::operation_lock(state)?;
-    // Copy and validate before publishing any files or changing the database.
-    let stage = tempfile::Builder::new()
-        .prefix(".handoff-restore-")
-        .tempdir_in(state.parent().context("无状态父目录")?)?;
-    for (rel, _) in inventory(&source)? {
-        let dest = stage.path().join(&rel);
-        crate::app::private_dir(dest.parent().context("无父目录")?)?;
-        fs::copy(source.join(rel), dest)?;
-    }
-    let manifest = validate_backup(stage.path())?;
+    let parent = state.parent().context("无状态父目录")?;
+    let _lock = crate::app::operation_lock(state, seconds, cancelled)?;
+    recover_restore(state)?;
+    let backup = tempfile::Builder::new()
+        .prefix(".handoff-backup-read-")
+        .tempdir_in(parent)?;
+    copy_tree(&source, backup.path())?;
+    let manifest = validate_backup(backup.path())?;
     ensure!(
         manifest.state == state,
         fault(
@@ -320,76 +476,237 @@ pub(crate) fn restore(state: &Path, path: &Path) -> Result<Value> {
         )
     );
     let database = state.join("handoff.sqlite3");
-    let mut current = Connection::open(&database)?;
-    current.busy_timeout(Duration::from_secs(10))?;
-    let has_state: bool = current.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='metadata')",
-        [],
-        |r| r.get(0),
-    )?;
-    let has_gc: bool = current.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='gc_runs')",
-        [],
-        |r| r.get(0),
-    )?;
-    if has_gc {
-        recover_gc(&current, state)?;
-    }
-    let rollback = if has_state {
-        let identity: String =
-            current.query_row("SELECT value FROM metadata WHERE key='state_id'", [], |r| {
-                r.get(0)
-            })?;
-        ensure!(
-            identity == manifest.state_id,
-            fault("RESTORE_IDENTITY_MISMATCH", "备份属于不同状态库")
-        );
-        let rollback = state
-            .parent()
-            .context("无父目录")?
-            .join(format!("handoff-rollback-{}", uuid::Uuid::new_v4()));
-        crate::app::private_dir(&rollback)?;
-        snapshot(&current, state, &rollback)?;
-        Some(rollback)
+    let current = if database.try_exists()? {
+        match read_snapshot(&database) {
+            Ok(db) => {
+                let initialized: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='metadata')",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if initialized {
+                    let identity: Option<String> = db
+                        .query_row("SELECT value FROM metadata WHERE key='state_id'", [], |r| {
+                            r.get(0)
+                        })
+                        .optional()?;
+                    if let Some(identity) = identity {
+                        ensure!(
+                            identity == manifest.state_id,
+                            fault("RESTORE_IDENTITY_MISMATCH", "备份属于不同状态库")
+                        );
+                        Some(db)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            Err(error) => {
+                let code = crate::error::response(&error)["code"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                ensure!(code == "STATE_CORRUPT", error);
+                None
+            }
+        }
     } else {
         None
     };
+    // Everything below is built off to the side; conflicts leave the live tree intact.
+    let before = if state.exists() {
+        inventory(state)?
+    } else {
+        BTreeMap::new()
+    };
+    let staged = tempfile::Builder::new()
+        .prefix(".handoff-restore-")
+        .tempdir_in(parent)?;
+    if state.exists() {
+        copy_tree(state, staged.path())?;
+    }
+    if let Some(current) = &current {
+        let has_gc: bool = current.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='gc_runs')",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_gc {
+            recover_gc(current, staged.path())?;
+        }
+    }
+    for suffix in [
+        "handoff.sqlite3",
+        "handoff.sqlite3-wal",
+        "handoff.sqlite3-shm",
+    ] {
+        let file = staged.path().join(suffix);
+        if file.exists() {
+            fs::remove_file(file)?;
+        }
+    }
+    fs::copy(
+        backup.path().join("handoff.sqlite3"),
+        staged.path().join("handoff.sqlite3"),
+    )?;
     for rel in manifest
         .files
         .keys()
         .filter(|p| p.as_path() != Path::new("handoff.sqlite3"))
     {
-        let dest = state.join(rel);
-        if dest.try_exists()? {
+        let dest = staged.path().join(rel);
+        let saved = fs::read(backup.path().join(rel))?;
+        crate::app::private_dir(dest.parent().context("无恢复父目录")?)?;
+        let bytes = if dest.try_exists()? {
             ensure!(
                 fs::symlink_metadata(&dest)?.is_file(),
                 fault("RESTORE_CONFLICT", "恢复目标被其他类型路径占用")
             );
-            // Keep later protocol client progress. Plan artifacts are immutable.
-            if !rel.starts_with("agents") {
+            let existing = fs::read(&dest)?;
+            if rel.starts_with("agents") && rel.extension().is_some_and(|v| v == "json") {
+                let id = rel
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .context("协议文件名无效")?;
+                restore_protocol(&existing, &saved, id)?
+            } else {
                 ensure!(
-                    hash(&fs::read(&dest)?) == manifest.files[rel],
+                    existing == saved,
                     fault("RESTORE_CONFLICT", "现有计划产物与备份冲突")
                 );
+                existing
             }
+        } else {
+            saved
+        };
+        fs::write(dest, bytes)?;
+    }
+    let snapshot_db = Connection::open(staged.path().join("handoff.sqlite3"))?;
+    let agents = snapshot_db
+        .prepare("SELECT id FROM protocol_agents")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for agent in agents {
+        ensure!(
+            !agent.is_empty()
+                && agent
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+            fault("BACKUP_INVALID", "备份中的接入标识无效")
+        );
+        crate::app::private_dir(&staged.path().join("agents").join(agent))?;
+    }
+    let delivered = snapshot_db
+        .prepare("SELECT body FROM plans WHERE status!='previewed'")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for body in delivered {
+        let plan: Value = serde_json::from_str(&body)?;
+        let agent = plan["target_agent"].as_str().unwrap_or("claude-desktop");
+        if crate::agent::builtin_target(agent) {
             continue;
         }
-        let parent = dest.parent().context("无父目录")?;
-        crate::app::private_dir(parent)?;
+        let target = Path::new(plan["target"].as_str().context("计划缺少目标路径")?)
+            .strip_prefix(state)
+            .map_err(|_| fault("BACKUP_INVALID", "协议目标路径超出备份状态目录"))?;
+        let prepared = Path::new(plan["prepared"].as_str().context("计划缺少产物路径")?)
+            .strip_prefix(state)
+            .map_err(|_| fault("BACKUP_INVALID", "计划产物路径超出备份状态目录"))?;
+        let prepared = fs::read(staged.path().join(prepared))
+            .map_err(|_| fault("BACKUP_INVALID", "协议目标的交付基线缺失"))?;
         ensure!(
-            parent.canonicalize()? == parent,
-            fault("RESTORE_CONFLICT", "恢复目录路径发生变化")
+            Some(hash(&prepared).as_str()) == plan["prepared_digest"].as_str(),
+            fault("BACKUP_INVALID", "协议目标交付基线摘要不符")
         );
-        fs::copy(stage.path().join(rel), &dest)?;
-        fs::File::open(&dest)?.sync_all()?;
+        let current = fs::read(staged.path().join(target))
+            .map_err(|_| fault("BACKUP_INVALID", "协议目标会话缺失"))?;
+        ensure!(
+            crate::protocol::continued(
+                plan["target_id"].as_str().context("缺少目标 ID")?,
+                &prepared,
+                &current
+            ),
+            fault("RESTORE_CONFLICT", "恢复候选缺少协议目标的已交付历史")
+        );
     }
-    current.restore(
-        "main",
-        stage.path().join("handoff.sqlite3"),
-        None::<fn(rusqlite::backup::Progress)>,
-    )?;
+    let check: String = snapshot_db.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+    ensure!(
+        check == "ok",
+        fault("BACKUP_INVALID", "恢复数据库完整性校验失败")
+    );
+    drop(snapshot_db);
+    // Generate a usable rollback backup for healthy state and retain the full
+    // original tree separately, including damaged files and unindexed plans.
+    let rollback = parent.join(format!("handoff-rollback-{}", uuid::Uuid::new_v4()));
+    let rollback_backup = if let Some(current) = current {
+        let destination = parent.join(format!("handoff-backup-{}", uuid::Uuid::new_v4()));
+        crate::app::private_dir(&destination)?;
+        snapshot(&current, state, &destination)?;
+        Some(destination)
+    } else {
+        None
+    };
+    ensure!(
+        before
+            == if state.exists() {
+                inventory(state)?
+            } else {
+                BTreeMap::new()
+            },
+        crate::error::fault(
+            "RESTORE_CHANGED",
+            "恢复准备期间本地文件发生变化",
+            "停止客户端写入后重试恢复。",
+            true
+        )
+    );
+    for rel in inventory(staged.path())?.keys() {
+        fs::File::open(staged.path().join(rel))?.sync_all()?;
+    }
+    fs::File::open(staged.path())?.sync_all()?;
+    let staged = staged.keep();
+    let journal = RestoreJournal {
+        state: state.into(),
+        staged: staged.clone(),
+        rollback: rollback.clone(),
+    };
+    persist_journal(&control_path(state, "restore.json")?, &journal)?;
+    let had_state = state.exists();
+    let mut moved_original = false;
+    let mut installed = false;
+    let activation = (|| -> Result<()> {
+        if had_state {
+            fs::rename(state, &rollback)?;
+            moved_original = true;
+        }
+        fs::rename(&staged, state)?;
+        installed = true;
+        fs::File::open(parent)?.sync_all()?;
+        fs::remove_file(control_path(state, "restore.json")?)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = activation {
+        if installed {
+            fs::rename(state, &staged)?;
+        }
+        if moved_original {
+            fs::rename(&rollback, state)?;
+        }
+        if staged.exists() {
+            fs::remove_dir_all(&staged)?;
+        }
+        let journal = control_path(state, "restore.json")?;
+        if journal.exists() {
+            fs::remove_file(journal)?;
+        }
+        return Err(error);
+    }
     Ok(
-        json!({"restored":source,"state":state,"rollback_backup":rollback,"preserved_later_files":true}),
+        json!({"restored":source,"state":state,"rollback_backup":rollback_backup,
+        "rollback_state":rollback.exists().then_some(rollback),"preserved_later_files":true}),
     )
 }
 pub(crate) fn archive(db: &mut Connection, _state: &Path, task: &str) -> Result<Value> {

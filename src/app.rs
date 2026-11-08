@@ -36,6 +36,11 @@ pub(crate) struct Cli {
     /// Maximum duration of each DeepSeek SDK operation.
     #[arg(long, global = true, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) adapter_timeout_seconds: u64,
+    /// Maximum wait for another state writer.
+    #[arg(long, global = true, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) lock_timeout_seconds: u64,
+    #[arg(skip)]
+    pub(crate) disconnected: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[command(subcommand)]
     pub(crate) command: Action,
 }
@@ -907,22 +912,55 @@ pub(crate) fn apply(cli: &Cli, db: &mut Connection, id: &str) -> Result<Value> {
     );
     Ok(result)
 }
-fn lock_file(state: &Path) -> Result<fs::File> {
-    Ok(fs::OpenOptions::new()
+// The lock remains at a stable sibling path while restore swaps the state tree.
+pub(crate) fn operation_lock(
+    state: &Path,
+    seconds: u64,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Vec<fs::File>> {
+    let path = crate::maintenance::control_path(state, "lock")?;
+    let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .open(state.join(".handoff-operation.lock"))?)
-}
-
-// OS-owned locks are released on process exit, including abrupt termination.
-// Always take this lock before starting a SQLite write transaction.
-pub(crate) fn operation_lock(state: &Path) -> Result<fs::File> {
-    let file = lock_file(state)?;
-    file.lock()?;
-    Ok(file)
+        .open(path)?;
+    let started = std::time::Instant::now();
+    let mut locks = vec![file];
+    // Respect the legacy lock when present. All current binaries also hold the
+    // stable sibling lock, including during a state-directory replacement.
+    let legacy = state.join(".handoff-operation.lock");
+    if legacy.try_exists()? {
+        locks.push(fs::OpenOptions::new().read(true).write(true).open(legacy)?);
+    }
+    for file in &locks {
+        loop {
+            if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+                return Err(crate::error::fault(
+                    "REQUEST_CANCELLED",
+                    "客户端已断开",
+                    "重新连接后核对原指派或计划状态。",
+                    true,
+                ));
+            }
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+            if started.elapsed() >= std::time::Duration::from_secs(seconds) {
+                return Err(crate::error::fault(
+                    "STATE_BUSY",
+                    "中转站写操作等待超时",
+                    "稍后用原计划或指派 ID 重试。",
+                    true,
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+    Ok(locks)
 }
 
 fn cleanup_orphans(db: &mut Connection, state: &Path) -> Result<()> {
@@ -981,19 +1019,30 @@ pub(crate) fn run(mut cli: Cli) -> Result<Value> {
             }
             | Action::Gc { execute: false, .. }
     );
-    if !read_only {
-        private_dir(&state)?;
-    }
+
     let state = if state.exists() {
         state.canonicalize()?
     } else {
         std::path::absolute(state)?
     };
     if let Action::Restore { path } = &cli.command {
-        return crate::maintenance::restore(&state, path);
+        return crate::maintenance::restore(
+            &state,
+            path,
+            cli.lock_timeout_seconds,
+            cli.disconnected.as_deref(),
+        );
     }
-    let write_lock = if !read_only && !matches!(cli.command, Action::Restore { .. }) {
-        Some(operation_lock(&state)?)
+    let write_lock = if !read_only {
+        private_dir(state.parent().context("无状态父目录")?)?;
+        let lock = operation_lock(
+            &state,
+            cli.lock_timeout_seconds,
+            cli.disconnected.as_deref(),
+        )?;
+        crate::maintenance::recover_restore(&state)?;
+        private_dir(&state)?;
+        Some(lock)
     } else {
         None
     };
@@ -1031,7 +1080,11 @@ pub(crate) fn run(mut cli: Cli) -> Result<Value> {
     let mut db = if read_only && !database_exists {
         Connection::open_in_memory()?
     } else {
-        Connection::open_with_flags(database, flags)?
+        if read_only {
+            crate::maintenance::read_snapshot(&database)?
+        } else {
+            Connection::open_with_flags(database, flags)?
+        }
     };
     db.busy_timeout(std::time::Duration::from_secs(10))?;
     if !read_only || !database_exists {

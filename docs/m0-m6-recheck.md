@@ -73,6 +73,43 @@ PYTHONPATH=tests python3 -m unittest -v m9_builtin_history
 
 最终完整回归通过 54 项测试，三端矩阵的 64 项检查与观察全部完成，其中主动拉取和指派共 12 条链路通过。构建、Rust 格式和文档链接检查通过。回归中发现既有中断测试在监督进程已回收 SDK 后重复发送终止信号，已改为断言 SDK 确实退出，并通过专项及完整复验。当前环境缺少 Clippy 组件，未执行 Clippy 检查。桌面窗口沿用历史验收证据，本轮验证协议、状态及原生存储。
 
+## main 独立复验：方案 1–6（`c78af41`）
+
+结论：**未整体验收通过**。在 macOS 隔离状态目录、Git worktree、真实 CLI 和 stdio MCP 上，格式检查、锁定依赖构建和 54 项回归通过；组合矩阵完成 64 项检查与观察，Codex、Claude Desktop、DeepSeek 六个方向的拉取和指派共 12 条全部通过。本轮验证到原生会话存储，没有重新操作桌面窗口。
+
+| 项 | 本轮证据 | 判定 |
+| --- | --- | --- |
+| 1 历史完整性 | 三个内置目标的新旧计划通过删改、合法续写、恢复后复用原 ID 回归。 | 通过 |
+| 2 只读查询 | 空状态下 MCP 能发现 Codex 会话且不创建状态目录；已有库的业务记录和准备目录保留。但已有 WAL 模式数据库缺少辅助文件时，第一次 MCP 查询改变了文件清单。 | 部分通过 |
+| 3 笔记 | 笔记改名后可列出并解绑；再次采集成功，另一个 worktree 的绑定和旧快照不变。依赖目录跳过测试通过。 | 通过 |
+| 4 备份恢复 | 并发指派与备份得到一致快照，回退后可用原 ID 领取；正常旧、新库往返通过。空目录恢复、协议历史冲突及失败回滚存在下列缺口。 | 未通过 |
+| 5 查询与复用 | 旧表迁移、分页、并发采集去重、HEAD 变化回归通过。另用 12,000 条约 2 KiB 的版本记录测来源查询：JSON 扫描中位数约 24 ms，命中 `version_source` 后约 0.006 ms（本机热缓存，非端到端延迟）。 | 已测路径通过 |
+| 6 归档与 GC | 待领取指派、活动分叉祖先、客户端会话和未知提交目录的保护回归通过。另在同一状态恢复旧备份后实际执行 GC，后建计划文件保留；放回最新备份，原指派领取到同一计划。 | 已测路径通过 |
+
+独立复现（均在临时数据上进行）：
+
+1. **P1 · 协议会话恢复误报成功。** 给已交付协议会话追加一条有效消息并备份，将本地文件退回追加前的有效内容，再恢复新备份：`restore` 和原 `claim` 都成功，但备份里的追加消息没有回来。把本地文件清空再恢复，同样报告成功，原 `claim` 随后返回 `TARGET_INVALID`。恢复应区分内容相同、哪一侧是合法续写，以及损坏或分叉；不能一律跳过已存在文件。
+2. **P1 · 已注册但尚无会话的 agent 不能从备份完整恢复。** 注册双向 agent、创建待领取指派并备份，移开整个状态目录，恢复到原路径：注册记录在库中，但协议会话目录未重建，原 `claim` 返回 `FILE_UNAVAILABLE`。重新注册同一 agent 后原指派可继续。
+3. **P1 · 失败的恢复会修改目标。** 在已备份计划中移走 `.handoff-commit-intent`，让后处理的 `transcript.txt` 与备份冲突。执行 `restore` 返回 `RESTORE_CONFLICT`，但原先缺少的标记已经写回。备份暂存校验不等于对目标的原子切换。另测当前 SQLite 主文件已损坏时，原地恢复有效备份会返回 `STATE_CORRUPT`；移开原状态目录和原地修复是不同场景。
+4. **P1 · 写操作等待文件锁没有期限。** 独立进程持有 `.handoff-operation.lock` 时，CLI 写入在 12 秒后仍等待；同一时段 MCP 的版本查询约 4 ms 返回。结束持锁进程后，排队的 CLI 和 MCP 写入都返回原版本 ID。另测客户端关闭 stdio 后，排队写入的 MCP 进程在 2 秒后仍在，释放锁后正常退出。对照：SQLite 锁冲突在 CLI/MCP 上约 10.4 秒返回可重试的 `STATE_BUSY`；慢启动器不阻塞其他指派，DeepSeek 超时及子进程回收回归通过。没有观察到循环死锁，但文件锁不能保证有界等待。
+5. **P2 · 只读查询仍有文件系统副作用。** 关闭最后一个写入连接，确认仅有 `handoff.sqlite3`，调用真实 MCP `get_handoff` 后出现 `-wal` 和 `-shm`。在尚无这两个文件的独立样本中，将状态目录设为只读后，CLI `status` 返回 `STATE_UNAVAILABLE`。现有测试的快照明确忽略了这两个文件，不能证明文件清单不变；未观察到查询改写业务记录。
+
+## 恢复一致性复验（`fix/handoff-restore-consistency`）
+
+保留上面的 `c78af41` 独立复验记录，五项缺口由本分支修复。新增 [m11_restore.py](../tests/m11_restore.py) 的 12 个隔离用例，通过真实 CLI、stdio MCP、SQLite 和 Git worktree 执行。另覆盖无 `target_agent` 字段的旧计划、异常来源候选的原样恢复，以及结构有效但交付历史不完整的协议目标被拒绝。
+
+| 缺口 | 修复与复验 |
+|---|---|
+| 新备份的协议历史未恢复 | 备份较新时补回消息，本地较新时保留续写。空白或损坏的本地文件用有效备份修复。两侧分叉返回 `RESTORE_CONFLICT`，核对完整文件清单、摘要和权限保持不变。原指派复用同一目标 ID。 |
+| 空 agent 目录未重建 | 移开整个状态目录后，在原路径恢复。已注册但没有会话的 agent 目录直接可用，原指派领取成功。 |
+| 冲突返回前发生部分写入 | 恢复在暂存状态中校验计划文件和协议历史，全部通过后切换目录。缺少提交标记且稍后的正文文件冲突时，原目录未被补写。当前数据库损坏或清空时，原始内容保留在 `rollback_state`，备份恢复后原计划可执行。另模拟原目录已移走但新目录尚未启用的中断，下一次写入恢复原状态。 |
+| 文件锁等待无上限 | 新旧两种文件锁分别被独立进程持有时，设置 1 秒等待期限，CLI 有界返回可重试的 `STATE_BUSY`。MCP 客户端关闭 stdin 后，排队写入取消，进程在 2 秒内退出。释放锁后原版本 ID 可继续使用。默认期限为 5 秒。 |
+| 只读查询创建辅助文件 | 新测试核对源目录全部文件及权限，包含 WAL、SHM。没有辅助文件的库和只读状态目录均可查询。有活动写入连接和已提交 WAL 时可见新版本，未提交的回滚日志记录保持不可见，源文件清单和摘要不变。原有 m10 快照也已取消对辅助文件的排除。 |
+
+旧备份与 GC 专项再次实际执行。先备份归档状态，再创建新指派与计划并保存最新备份。恢复旧库后执行 GC，旧归档计划被选中清理，后建计划的文件摘要保持一致。放回最新备份，原指派 ID 领取同一计划。较慢启动器和 DeepSeek 子进程回收继续由既有回归覆盖。
+
+最终锁定依赖构建、Rust 格式检查和 66 项自动化测试通过。三端组合矩阵完成 64 项检查与观察，其中六个有向组合的拉取和指派共 12 条链路通过。旧计划兼容补充后，12 个恢复专项用例再次通过。只读查询当前使用完整数据库的私有副本以避免源目录写入，大状态库的端到端延迟尚未量测。本轮验证到协议、状态库和原生会话存储，桌面窗口沿用历史验收证据。恢复仍要求原状态路径，升级后应重启各 MCP 服务以统一锁协议。
+
 ## Reproduce / 本地复现
 
 Start from the repository root on macOS with Git, Rust 1.96+, Python 3 and zstd. The full suite requires Node.js 24.9+ and the tested Harness package on PATH. For example, install the SDK with `npm install --global @deepseek-ai/dsh@0.2.2-rc.1`.
@@ -84,6 +121,6 @@ python3 -m unittest discover -s tests -p 'm*.py' -v
 python3 tests/acceptance_matrix.py
 ```
 
-The regression suite contains 54 tests. The matrix runs 64 checks and observations, including the 12 cross-client pull and assignment flows. It writes a JSON report to stdout. The held-database-lock case allows 30 seconds for its MCP response, records CLI/MCP elapsed times, and verifies capture succeeds after the lock is released. Other requests retain the default 15-second timeout. The commands use isolated fixture data; no live conversations or credentials are required.
+The regression suite contains 66 tests. The matrix runs 64 checks and observations, including the 12 cross-client pull and assignment flows. It writes a JSON report to stdout. The held-database-lock case allows 30 seconds for its MCP response, records CLI/MCP elapsed times, and verifies capture succeeds after the lock is released. Other requests retain the default 15-second timeout. The commands use isolated fixture data; no live conversations or credentials are required.
 
 Use [the backup and recovery tests](../tests/m7_boundaries.py) for the database restore scenarios. To reproduce the manual worktree check, run `python3 scripts/m0_fixture.py` to generate a disposable repository and native-test inputs under the ignored `.m0` directory. After continuing a task in the real target client, use `python3 scripts/m0_verify.py --help` to check an exported native transcript against that fixture.

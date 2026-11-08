@@ -113,7 +113,7 @@ handoff gc --older-than 30d
 handoff gc --older-than 30d --execute
 ```
 
-版本和收件箱列表返回 `next_cursor`，下一页通过 `--cursor` 传入，MCP 使用 `cursor` 参数。恢复使用备份记录的原状态目录，操作前生成回退备份。原 worktree 和内置客户端会话库需要单独保留。清理默认预览显式归档的任务。[状态维护与恢复约定](docs/development-plan.md)
+版本和收件箱列表返回 `next_cursor`，下一页通过 `--cursor` 传入，MCP 使用 `cursor` 参数。恢复使用备份记录的原状态目录，校验完整暂存状态后切换，原目录保留为 `rollback_state`。协议会话采用较长的合法续写，历史分叉时报告冲突，空白或损坏的本地会话可用有效备份恢复。当前数据库健康时还生成 `rollback_backup`。原 worktree 和内置客户端会话库需要单独保留。清理默认预览显式归档的任务。写操作等待文件锁默认上限为 5 秒，可用 `--lock-timeout-seconds` 调整。升级后重启 MCP 服务以统一锁协议。[状态维护与恢复约定](docs/development-plan.md)
 
 ## CLI 与 MCP 接口
 

@@ -22,7 +22,7 @@ class StateTests(unittest.TestCase):
     def snapshot(self):
         state = self.f.root / 'state'
         return {str(p.relative_to(state)): hashlib.sha256(p.read_bytes()).hexdigest()
-                for p in state.rglob('*') if p.is_file() and p.suffix not in ('.sqlite3-shm', '.sqlite3-wal')}
+                for p in state.rglob('*') if p.is_file()}
 
     def test_read_only_and_missing_state(self):
         f = self.f
