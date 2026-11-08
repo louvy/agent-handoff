@@ -1,0 +1,29 @@
+name: Test
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install test dependencies
+        run: |
+          rustup update stable --no-self-update
+          rustup component add rustfmt --toolchain stable
+          npm install --global @deepseek-ai/dsh@0.2.2-rc.1
+          command -v zstd || brew install zstd
+      - name: Build and verify
+        run: |
+          cargo +stable fmt --check
+          cargo +stable build --locked
+          python3 -m unittest discover -s tests -p 'm*.py' -v
+          python3 tests/acceptance_matrix.py
